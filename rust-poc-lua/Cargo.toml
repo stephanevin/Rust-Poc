@@ -1,0 +1,43 @@
+[package]
+name = "rust-poc-lua"
+version = "0.1.0"
+edition = "2024"
+description = "In-process Lua 5.4 collector runtime + host bindings (Windows-only; stub elsewhere)"
+publish = false
+
+[dependencies]
+serde_json = "1"
+thiserror  = "2"
+# `fs` added vs sdh-fleet-client/lua/Cargo.toml: runtime.rs uses
+# `tokio::fs::read_to_string`. In the sdh-fleet-client workspace this
+# compiles because another crate's tokio dep activates `fs` and Cargo
+# unifies features. Adding `fs` here keeps `cargo check -p rust-poc-lua`
+# working in isolation.
+tokio      = { version = "1", features = ["rt", "time", "fs"] }
+tracing    = "0.1"
+
+# Real Lua/WMI bindings only on Windows. macOS planned target gets the
+# stub path — there is no equivalent host plane (WMI/Registry/ADSI) on
+# macOS. macOS support will land as a sibling crate when it lands.
+[target.'cfg(windows)'.dependencies]
+mlua    = { version = "0.11", features = ["lua54", "vendored", "serialize"] }
+wmi     = "0.17"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Registry",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Wdk",
+    "Wdk_System",
+    "Wdk_System_SystemServices",
+] }
+
+[lints]
+workspace = true
