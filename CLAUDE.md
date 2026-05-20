@@ -36,6 +36,16 @@ cargo run -- general.lua some-perimeter      # Pass script + perimeter args expl
 cargo build --release                        # Optimised final binary in target/release/collect-config.exe
 ```
 
+```powershell
+# Build the Windows installer EXE (Inno Setup). Reads the version from
+# Cargo.toml, stages target/release/collect-config.exe + collectors/
+# into ./publish/, signs the binary, then compiles
+# Setup/CollectConfigSetup.iss into Setup/Output/CollectConfigSetup-<v>.exe.
+.\publish-innosetup.ps1                      # signed (requires SDH_SIGN_THUMBPRINT + cert in store)
+.\publish-innosetup.ps1 -SkipSign            # local dev iteration, unsigned EXE
+.\publish-innosetup.ps1 -SkipBuild           # rebuild only the EXE (publish/ already populated)
+```
+
 Note: `cargo run` at the workspace root launches `collect-config`
 thanks to the `default-run = "collect-config"` key in the root
 `Cargo.toml`. The workspace currently exposes a **single** binary
@@ -64,7 +74,7 @@ structure of `sdh-fleet-client`:
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 17 `host.*` bindings (WMI, registry, networking, ADSI). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 20 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
 | **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
@@ -113,6 +123,23 @@ Round-trip tests are the cheapest defence against accidental wire
 breakage — pin the exact JSON string with `assert_eq!`. Reintroduce
 that pattern as soon as a non-trivial type lands.
 
+### JSON key ordering
+
+`serde_json/preserve_order` is **not** enabled. `serde_json::Map` uses
+its default `BTreeMap` backing, which sorts keys alphabetically.
+
+This is the deliberately chosen trade-off: `preserve_order` switches
+to `IndexMap` (insertion order), but Lua 5.4 does **not** guarantee
+stable iteration order for hash tables with more than ~15 entries. The
+`general.lua` table has ~28 entries, so `preserve_order` would produce
+Lua-hash order (effectively random) rather than source order — worse
+than alphabetical for human inspection. Alphabetical order at least
+lets the reader `Ctrl+F` predictably.
+
+If a strict source-order guarantee ever becomes necessary, the correct
+approach is to use an ordered Lua table (array of `{key, value}` pairs)
+and convert it on the Rust side — not `preserve_order` alone.
+
 ## Logging
 
 Tracing stack mirrored from `sdh-fleet-client/src/logging.rs`, minus
@@ -160,10 +187,17 @@ if the directory turns out to be unwritable, same posture as
 - Crates that do work (`rust-poc-lua/`) depend on `tracing` only, not
   on `tracing-subscriber`. Macros expand to no-ops when no subscriber
   is installed, which keeps unit tests free of any setup boilerplate.
-- The root binary owns the `WorkerGuard` returned by `logging::init()`
-  in a `_log_guard` local that must live for the whole program.
-  Dropping it kills the non-blocking writer's worker thread and
-  silently loses any pending log lines.
+- `logging::init()` returns `(WorkerGuard, PathBuf)`. The root binary
+  destructures it as `let (_log_guard, log_dir) = logging::init();`:
+  - `_log_guard` must live for the whole program. Dropping it kills
+    the non-blocking writer's worker thread and silently loses any
+    pending log lines.
+  - `log_dir` is the resolved log directory, captured once so the
+    binary can colocate other per-run artefacts (e.g. the JSON dump
+    that `write_output_file` produces) without re-resolving
+    `RUST_POC_LOG_DIR`. A second `resolve_log_dir()` call could
+    observe a different value if the env var changed between calls
+    — a TOCTOU we sidestep by returning the path from `init()`.
 
 ## Lua collector runtime
 
@@ -184,16 +218,17 @@ rust-poc-lua/src/
 ├── lib.rs          # Public API + non-Windows stub
 ├── runtime.rs      # InternalRuntime::run — async, tokio::spawn_blocking + timeout
 ├── sandbox.rs      # Strips io/dofile/require/etc. globals
-├── host.rs         # 17 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── host.rs         # 18 `host.*` bindings + HostState (Rc<RefCell<..>>)
 ├── wmi.rs          # COMLibrary + WMIConnection + per-class cache
 ├── registry.rs     # RegOpenKeyExW + RegQueryValueExW + REG_* decode
 ├── net.rs          # GetAdaptersAddresses + IPv4 enumeration
+├── hostname.rs     # GetComputerNameExW — 3 variants (deviation #6, not in upstream)
 ├── winver.rs       # RtlGetVersion + GetFirmwareType
 ├── eventlog.rs     # Install date (registry-derived ISO 8601)
 └── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 17 `host.*` bindings exposed to Lua
+### The 20 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -205,6 +240,9 @@ rust-poc-lua/src/
 | `host.rtl_get_version()` | `RtlGetVersion` | `{major, minor, build}?` |
 | `host.get_firmware_type()` | `GetFirmwareType` | `"UEFI" \| "BIOS" \| nil` |
 | `host.net_interfaces()` | `GetAdaptersAddresses` (loopback filtered) | `array<{name, ipv4[]}>?` |
+| `host.netbios_name()` **(deviation #6)** | `GetComputerNameExW(ComputerNameNetBIOS)` | `string?` |
+| `host.host_name()` **(deviation #6)** | `GetComputerNameExW(ComputerNameDnsHostname)` | `string?` |
+| `host.fqdn()` **(deviation #6)** | `GetComputerNameExW(ComputerNameDnsFullyQualified)` | `string?` |
 | `host.adsi_user_mail(timeout_s)` | ADSI stub (returns nil unless USERDNSDOMAIN is set) | `string?` |
 | `host.setup_history()` | `eventlog::install_info` | `{install_date, history[]}` |
 | `host.cpu_details()` | WMI `Win32_Processor.Name + SocketDesignation` | `string?` |
@@ -250,9 +288,10 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **five** points where copying upstream byte-for-byte
-won't compile. Each one is documented inline at the touch site so a
-future re-sync is mechanical.
+There are exactly **six** points where copying upstream byte-for-byte
+would not compile or would not match the surface this PoC needs to
+expose. Each one is documented inline at the touch site so a future
+re-sync is mechanical.
 
 1. **`rust-poc-lua/Cargo.toml` — package name**
    `name = "sdh-fleet-lua"` → `name = "rust-poc-lua"`.
@@ -285,6 +324,33 @@ future re-sync is mechanical.
    Added a targeted `#[allow]` (with a FIXME comment) instead of
    refactoring, so a future `Copy-Item` from upstream stays a one-liner
    diff. Drop the `#[allow]` once upstream refactors the closure.
+
+6. **`rust-poc-lua/src/hostname.rs` + `install_hostname_bindings` in
+   `host.rs` — three additional hostname bindings.**
+   Upstream exposes 17 `host.*` bindings; this PoC exposes 20. The
+   three extra bindings all call `GetComputerNameExW` with a different
+   `COMPUTER_NAME_FORMAT` constant (non-`Physical*` variants — parité
+   avec `IPGlobalProperties.HostName` de .NET, voir ci-dessous) :
+   - `host.netbios_name()` — `ComputerNameNetBIOS` (≤ 15 chars, ASCII
+     uppercase). Equivalent à `%COMPUTERNAME%` / `Environment.MachineName`.
+   - `host.host_name()` — `ComputerNameDnsHostname` (no dots). Même
+     valeur que `IPGlobalProperties.HostName`. Diffère de `netbios_name`
+     sur les machines renommées ou avec un `DnsHostName` GPO override.
+   - `host.fqdn()` — `ComputerNameDnsFullyQualified`. Egal à `host_name`
+     hors domaine; porte le suffixe AD (e.g. `.sanofi.com`) sur les
+     machines domain-joined.
+   All three use **non-`Physical*`** constants to match .NET semantics.
+   On standard Sanofi endpoints (no Failover Cluster) the Physical and
+   non-Physical variants return identical strings. On a Windows Failover
+   Cluster node `Physical*` would give the physical node name; the
+   current non-Physical choice gives the logical/cluster name — matching
+   what `IPGlobalProperties.HostName` returns. This decision is a
+   deliberate trade-off: revert by swapping to `ComputerNamePhysical*`
+   in `hostname.rs` if cluster deployments emerge.
+   Re-sync impact: if upstream eventually adds equivalent bindings,
+   align names + signatures and drop this deviation. Until then, every
+   upstream `Copy-Item` MUST preserve `hostname.rs` and the
+   `install_hostname_bindings` call in `host.rs`.
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is
@@ -339,6 +405,23 @@ studying when the crate's source rolls past:
 - **Vendored C deps** — `mlua` feature `vendored` builds Lua 5.4 from
   C sources at compile time. First build is slow (~30s+); incremental
   builds are normal.
+- **`fn` pointer as parameter** — `bind_hostname` in `host.rs` takes
+  `f: fn() -> Result<String, String>`. A bare function pointer (`fn`)
+  is cheaper than a trait object (`Box<dyn Fn>`) or a generic bound
+  (`<F: Fn>`) when every call site passes a named free function with no
+  captured state. The compiler can inline through it; no heap allocation.
+- **Parameterised FFI** — `get_computer_name(format: COMPUTER_NAME_FORMAT)`
+  in `hostname.rs` factors the two-call sizing pattern once; three
+  one-liner wrappers delegate to it. This keeps the `unsafe` surface
+  to a single site, reducing audit scope. `COMPUTER_NAME_FORMAT` is a
+  Rust newtype in `windows-rs`, not a raw `u32` — the compiler rejects
+  passing an untyped integer, encoding the invariant at the type level.
+- **`BTreeMap` vs `IndexMap`** — `serde_json::Map` defaults to `BTreeMap`
+  (alphabetical key order, O(log n) lookup). The `preserve_order` feature
+  would switch it to `IndexMap` (insertion order, O(1) hash lookup), but
+  this only helps when the producer also controls key order — which Lua
+  5.4 hash tables do not guarantee for large tables. Alphabetical is
+  chosen deliberately here. (See also: `indexmap` crate.)
 
 ### Known stubs left intentionally incomplete
 
@@ -350,6 +433,70 @@ studying when the crate's source rolls past:
 
 Both stubs are documented in their source files. They surface as `null`
 or `[]` in the JSON output, never as errors.
+
+## Installer (Inno Setup)
+
+The Windows installer lives in `Setup/` and is modelled on
+[`sdh-complianceapp/Setup/`](../../sdh-complianceapp/Setup/) (~5x smaller
+because Rust-Poc has no service, no perimeter wizard, no legacy MSI
+bridge, no JSON patching). See [`Setup/README.md`](Setup/README.md) for
+the full design notes.
+
+### Files involved
+
+| Path | Role |
+|---|---|
+| `Setup/CollectConfigSetup.iss` | Inno Setup script — `[Setup]`, `[Files]`, `[Registry]`, `[Dirs]`, `[Icons]`, `[InstallDelete]`, `[UninstallDelete]`. Pinned `MyAppId` GUID. |
+| `Setup/Output/` | Generated `CollectConfigSetup-<Version>.exe`. Gitignored. |
+| `publish-innosetup.ps1` | Orchestrator: `cargo build --release` → stage to `./publish/` → sign binary (pass #1) → ISCC → sign EXE + uninstaller (pass #2) → `Get-AuthenticodeSignature` sanity check. |
+| `publish/` | Staging folder (Rust analogue of `dotnet publish`). Gitignored. |
+
+### Critical invariants (do not regress)
+
+- **`MyAppId = {848231EB-C945-463F-9DEC-E90E12B4781D}` is frozen forever.**
+  Once an installer ships with this GUID, changing it breaks the
+  Inno-to-Inno upgrade chain (new install creates a parallel ARP entry
+  instead of upgrading). NEVER reuse the compliance app's
+  `{CA9A7A52-9076-42BB-95F0-FD2B3A374210}` or any other shipped GUID.
+- **Two-pass signing.** Sign `publish\collect-config.exe` BEFORE ISCC
+  embeds it in the LZMA payload (pass #1, via `Invoke-SignFile`), then
+  let ISCC sign the final EXE + embedded uninstaller (pass #2, via the
+  `/Ssdh=<wrapper.cmd> $f` mechanism). Skipping pass #1 ships an
+  unsigned binary inside a signed installer — passes SmartScreen on
+  install but trips AppLocker / WDAC at first launch.
+- **Signing wrapper is a `.cmd` file, NOT `/Ssdh="signtool sign ..."`
+  directly.** PowerShell 5.1's native arg quoting is broken when an
+  arg contains both spaces and embedded double quotes. The `.cmd`
+  wrapper takes `$f` as `%1` and re-quotes in batch rules. See the
+  inline comment in `publish-innosetup.ps1` for the full rationale.
+- **`#ifdef SIGN` gates BOTH `SignTool=sdh` and `SignedUninstaller=yes`
+  in the `.iss`.** Without the gate, an unsigned compile (passing
+  `-SkipSign`) would fail with "SignTool 'sdh' not defined" because
+  ISCC strictly requires that any `SignTool=<name>` reference be
+  matched by a `/S<name>=...` command-line definition. The wrapper
+  conditionally passes `/DSIGN=1`.
+- **`HKLM\...\Environment\RUST_POC_LOG_DIR = C:\SMSLogs`** is set by
+  `[Registry]` to override the default `<exe-dir>\logs` fallback
+  (which would need admin write for every log line under Program
+  Files). Coordinated with `LOG_DIR_ENV_VAR` in `src/logging.rs`
+  (priority #1).
+- **`C:\SMSLogs` is `uninsneveruninstall`.** Shared folder with other
+  Sanofi tools; do not nuke it on uninstall.
+
+### When to extend
+
+The single `.iss` stays in `Setup/` as long as it remains readable
+(~150 lines today). Split into `Setup/Scripts/*.iss` modules à la
+compliance app when:
+
+- A Pascal `[Code]` block emerges (scheduled task creator, ARP rename
+  per perimeter, custom wizard page).
+- The `.iss` crosses ~250 lines.
+- A bridge to a previous installer format is needed (currently N/A).
+
+Each module gets `#include "Scripts\<Module>.iss"` from
+`[Code]` in the main `.iss`. Forward-declare any function called from
+the main script — Pascal scoping does not see ahead.
 
 ## Code quality
 

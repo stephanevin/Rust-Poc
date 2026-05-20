@@ -76,8 +76,14 @@ function collect()
   if type(pending) == "table" then pending_count = #pending end
 
   local result = {
-    -- Session Info
-    machine_name             = host.env("COMPUTERNAME"),
+    -- Session Info — machine identity.
+    -- All three names are equal on workgroup machines; on domain-joined
+    -- machines fqdn carries the AD DNS suffix (e.g. ".sanofi.com").
+    -- Win32 backing: ComputerNameNetBIOS / ComputerNameDnsHostname /
+    -- ComputerNameDnsFullyQualified (see rust-poc-lua/src/hostname.rs).
+    machine_name             = host.netbios_name(),
+    host_name                = host.host_name(),
+    fqdn                     = host.fqdn(),
     user_name                = host.env("USERNAME"),
     logon_domain             = host.env("USERDOMAIN"),
     mail_address             = host.adsi_user_mail(15),

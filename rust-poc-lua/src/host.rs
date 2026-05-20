@@ -88,6 +88,7 @@ pub(super) fn install(
     install_registry_bindings(lua, &host, &state)?;
     install_winver_bindings(lua, &host)?;
     install_net_bindings(lua, &host, &state)?;
+    install_hostname_bindings(lua, &host, &state)?;
     install_ad_bindings(lua, &host, &state)?;
     install_setup_history(lua, &host)?;
     install_composites(lua, &host, &state)?;
@@ -244,6 +245,50 @@ fn install_net_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<(
         )?;
     }
 
+    Ok(())
+}
+
+// --- Hostname (NetBIOS / DNS hostname / FQDN) -------------------------
+//
+// Deviation #6 from the verbatim upstream port: these three bindings are
+// not in `sdh-fleet-client/lua/host.rs` yet. They expose the three
+// standard Windows machine-name variants so collectors can surface
+// whichever granularity they need. See `super::hostname` for the Win32
+// backing constants, invariants, and the non-Physical rationale.
+
+/// Registers one hostname binding.
+///
+/// `name` must be `'static` so it can be captured into the `'static`
+/// closure that `lua.create_function` requires. `f` is a bare function
+/// pointer (`fn`, not `Fn`) — sufficient because each getter is a named
+/// free function, not a closure that captures state.
+fn bind_hostname(
+    lua: &Lua,
+    host: &Table,
+    state: &HostRef,
+    name: &'static str,
+    f: fn() -> Result<String, String>,
+) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        name,
+        lua.create_function(move |_, ()| {
+            let mut st = s.borrow_mut();
+            match f() {
+                Ok(v) => Ok(Some(v)),
+                Err(e) => {
+                    st.record_error(name, e);
+                    Ok(None)
+                }
+            }
+        })?,
+    )
+}
+
+fn install_hostname_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    bind_hostname(lua, host, state, "netbios_name", super::hostname::netbios_name)?;
+    bind_hostname(lua, host, state, "host_name",    super::hostname::dns_hostname)?;
+    bind_hostname(lua, host, state, "fqdn",         super::hostname::dns_fqdn)?;
     Ok(())
 }
 

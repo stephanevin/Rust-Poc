@@ -1,4 +1,4 @@
-//! In-process Lua 5.4 collector runtime + 17 `host.*` bindings.
+//! In-process Lua 5.4 collector runtime + 20 `host.*` bindings.
 //!
 //! This crate is **Windows-only** (real impl). On every other target
 //! (Linux dev/CI, macOS until macOS host bindings exist) it compiles to
@@ -7,11 +7,14 @@
 //!
 //! ## Wire contract
 //!
-//! The 17 `host.*` Lua bindings (see `HOST_API` in the sdh-fleet-client/contracts crate)
-//! are the source of truth. The runtime module here MUST stay in lockstep —
-//! every change to `HOST_API` requires a matching change in `host.rs` and
-//! a regenerated `host-api.json` (the portal's Monaco editor depends on
-//! the JSON; the CI drift gate enforces it).
+//! 17 of the 20 `host.*` bindings are a verbatim port of `HOST_API` in
+//! the upstream `sdh-fleet-client/contracts` crate; the runtime here
+//! MUST stay in lockstep with those — every change to `HOST_API` requires
+//! a matching change in `host.rs` and a regenerated `host-api.json` (the
+//! portal's Monaco editor depends on the JSON; the CI drift gate enforces
+//! it). The remaining three (`host.netbios_name()`, `host.host_name()`,
+//! and `host.fqdn()` in [`hostname`]) are deliberate additions on top of
+//! the upstream surface; see `CLAUDE.md` § *Deviations* #6.
 
 /// Failures from the Lua collector runtime.
 ///
@@ -28,6 +31,11 @@ mod ad;
 mod eventlog;
 #[cfg(windows)]
 mod host;
+// `hostname` is the deviation #6 module — added on top of the verbatim
+// port to expose `host.netbios_name()`, `host.host_name()`, and
+// `host.fqdn()` (machine-name variants via GetComputerNameExW).
+#[cfg(windows)]
+mod hostname;
 #[cfg(windows)]
 mod net;
 #[cfg(windows)]

@@ -13,19 +13,23 @@ Objectif : apprendre les idiomes Rust (workspace multi-crates, FFI Windows, sand
 
 ```
 Rust-Poc/
-├── Cargo.toml              # Workspace root + crate binaire `rust-poc`
-├── rust-toolchain.toml     # Pin Rust 1.95.0 + clippy + rustfmt
+├── Cargo.toml                  # Workspace root + crate binaire `rust-poc`
+├── rust-toolchain.toml         # Pin Rust 1.95.0 + clippy + rustfmt
+├── publish-innosetup.ps1       # Orchestrateur build → stage → sign → ISCC
 ├── src/
-│   ├── main.rs             # Binaire `collect-config` — entry point
-│   └── logging.rs          # Stack tracing (console stderr + JSON file)
+│   ├── main.rs                 # Binaire `collect-config` — entry point
+│   └── logging.rs              # Stack tracing (console stderr + JSON file)
 ├── collectors/
-│   └── general.lua         # Script collector exécuté par défaut
-├── contracts/              # Placeholder pour de futurs wire-types
+│   └── general.lua             # Script collector exécuté par défaut
+├── contracts/                  # Placeholder pour de futurs wire-types
 │   ├── Cargo.toml
 │   └── src/lib.rs
-└── rust-poc-lua/           # Runtime mlua + bindings host.* (WMI, Registry, AD, ...)
-    ├── Cargo.toml
-    └── src/                # runtime.rs, host.rs, sandbox.rs, ad.rs, wmi.rs, ...
+├── rust-poc-lua/               # Runtime mlua + bindings host.* (WMI, Registry, AD, ...)
+│   ├── Cargo.toml
+│   └── src/                    # runtime.rs, host.rs, sandbox.rs, ad.rs, wmi.rs, ...
+└── Setup/                      # Installeur Inno Setup
+    ├── CollectConfigSetup.iss  # Script principal (~150 lignes)
+    └── README.md               # Design notes, signing, GUID dédié
 ```
 
 ## Mapping vers `sdh-fleet-client`
@@ -67,6 +71,31 @@ cargo fmt --all
 # Compile en release (optimisations + binaire final)
 cargo build --release
 ```
+
+## Installeur Windows
+
+```powershell
+# Build complet — version lue depuis Cargo.toml, .exe signé Authenticode
+.\publish-innosetup.ps1
+
+# Itération locale sans signature (SmartScreen va râler, OK pour les tests)
+.\publish-innosetup.ps1 -SkipSign
+
+# Rebuild de l'EXE uniquement (publish/ déjà peuplé d'un run précédent)
+.\publish-innosetup.ps1 -SkipBuild
+```
+
+Sortie : `Setup/Output/CollectConfigSetup-<Version>.exe` — installeur Inno
+Setup modélisé sur [`sdh-complianceapp/Setup/`](../sdh-complianceapp/Setup/),
+en plus simple (pas de service Windows, pas de wizard, pas de bridge MSI).
+Détails de design + ce que l'installeur fait/ne fait pas : voir
+[`Setup/README.md`](Setup/README.md).
+
+Prérequis (validés en pre-flight par le script) :
+
+- **Inno Setup 6** sur le PATH ou sous `Program Files (x86)` (`winget install JRSoftware.InnoSetup`).
+- **Windows SDK** pour `signtool.exe` (`winget install Microsoft.WindowsSDK.10.0.26100`) — seulement si signature.
+- **Certificat code-signing** importé dans `Cert:\CurrentUser\My`, thumbprint dans `$env:SDH_SIGN_THUMBPRINT` — seulement si signature.
 
 ## Resultat attendu de `cargo run`
 
