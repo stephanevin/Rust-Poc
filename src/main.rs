@@ -25,6 +25,18 @@
 //! cargo run --quiet -- general.lua | jq '.machine_name'
 //! ```
 //!
+//! ## Per-run output file
+//!
+//! Each successful run also writes the same JSON to a per-run file
+//! `<script_stem>_<hostname>_YYYYMMDDhhmmss_fff.json` (local wall-clock,
+//! 18-char timestamp: 14 chars `YYYYMMDDhhmmss` + `_` + 3-digit
+//! millisecond suffix, to keep two runs in the same second from
+//! colliding) next to the rolling log. Example:
+//! `general_E00AVDDWDEV0271_20260520120140_837.json`. The file is a
+//! best-effort audit trail — a failure to write it warns on stderr and
+//! the rest of the run still succeeds (the stdout JSON is the primary
+//! contract).
+//!
 //! ## Exit codes
 //!
 //! - `0` — success
@@ -51,7 +63,11 @@ async fn main() -> ExitCode {
     // dropped, the non-blocking file writer's worker thread shuts down
     // and any pending log lines still in its channel are lost. Same
     // invariant as `sdh-fleet-client/src/main.rs::_log_guard`.
-    let _log_guard = logging::init();
+    //
+    // `log_dir` is captured here (rather than re-resolved later) so
+    // the per-run JSON dump file lands in the SAME directory as the
+    // rolling log even if RUST_POC_LOG_DIR changes mid-run.
+    let (_log_guard, log_dir) = logging::init();
 
     let args: Vec<String> = std::env::args().collect();
     let script = args.get(1).cloned().unwrap_or_else(|| "general.lua".into());
@@ -79,7 +95,11 @@ async fn main() -> ExitCode {
         }
     };
 
-    let runtime = InternalRuntime::new(cache_dir, hostname, env!("CARGO_PKG_VERSION").to_string());
+    let runtime = InternalRuntime::new(
+        cache_dir,
+        hostname.clone(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
 
     eprintln!(
         "collect-config: running {script} (perimeter={})",
@@ -92,6 +112,7 @@ async fn main() -> ExitCode {
     {
         Ok(value) => match serde_json::to_string_pretty(&value) {
             Ok(json) => {
+                write_output_file(&log_dir, &script, &hostname, &json);
                 println!("{json}");
                 ExitCode::SUCCESS
             }
@@ -105,6 +126,55 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Writes `json` to a per-run audit file under `log_dir`. Best-effort:
+/// any I/O failure is downgraded to a `tracing::warn!` so the stdout
+/// JSON contract (the primary deliverable) is preserved.
+///
+/// File name format: `<script_stem>_<hostname>_YYYYMMDDhhmmss_fff.json`,
+/// e.g. `general_E00AVDDWDEV0271_20260520120140_837.json`. Local
+/// wall-clock is used so the file name sorts naturally for an admin
+/// in the same timezone as the machine.
+fn write_output_file(log_dir: &Path, script: &str, hostname: &str, json: &str) {
+    let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S_%3f").to_string();
+    let file_name = output_file_name(script, hostname, &timestamp);
+    let out_path = log_dir.join(&file_name);
+
+    match std::fs::write(&out_path, json) {
+        Ok(()) => tracing::info!(path = %out_path.display(), "wrote JSON output file"),
+        Err(e) => tracing::warn!(
+            path = %out_path.display(),
+            error = %e,
+            "failed to write JSON output file (stdout JSON still emitted)"
+        ),
+    }
+}
+
+/// Builds the per-run output file name from its three constituents.
+///
+/// `Path::file_stem` strips the LAST extension, so `general.lua` becomes
+/// `general` and `subdir/general.lua` becomes `general`. A script
+/// without an extension (e.g. `general`) is used as-is. Pure function
+/// — separated out so `#[cfg(test)]` can pin the exact string format
+/// without touching the clock or the filesystem.
+///
+/// # Known gap — basename collisions across subdirectories
+///
+/// Because only the basename's stem is kept, two scripts with the same
+/// file name in different subdirs of `collectors/` (e.g.
+/// `collectors/rd/general.lua` and `collectors/mns/general.lua`) would
+/// generate the SAME output file name within the same millisecond
+/// window and the second run would silently overwrite the first.
+/// `collectors/` is intentionally flat today so this gap is dormant.
+/// When the layout grows subdirs, fold a sanitised relative path
+/// segment (e.g. `rd_general`, `mns_general`) into the stem.
+fn output_file_name(script: &str, hostname: &str, timestamp: &str) -> String {
+    let stem = Path::new(script)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(script);
+    format!("{stem}_{hostname}_{timestamp}.json")
 }
 
 /// Resolves `script` against `cache_dir` and guarantees the result stays
@@ -173,6 +243,51 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err for {absolute:?}, got {result:?}"
+        );
+    }
+
+    // ---- output_file_name --------------------------------------------------
+    //
+    // Pure function, decoupled from chrono. The timestamp is passed in
+    // as a &str so the test can pin the exact byte sequence the user
+    // requested in the spec (see commit history / chat).
+
+    #[test]
+    fn output_file_name_strips_the_lua_extension() {
+        assert_eq!(
+            output_file_name("general.lua", "E00AVDDWDEV0271", "20260520120140_837"),
+            "general_E00AVDDWDEV0271_20260520120140_837.json"
+        );
+    }
+
+    #[test]
+    fn output_file_name_strips_directory_components() {
+        // `Path::file_stem` returns just the basename's stem, so the
+        // optional subdir prefix the user could type as the script arg
+        // (e.g. `subdir/general.lua`) does not leak into the output
+        // file name.
+        assert_eq!(
+            output_file_name("subdir/general.lua", "HOST", "TS"),
+            "general_HOST_TS.json"
+        );
+    }
+
+    #[test]
+    fn output_file_name_handles_a_script_with_no_extension() {
+        assert_eq!(
+            output_file_name("general", "HOST", "TS"),
+            "general_HOST_TS.json"
+        );
+    }
+
+    #[test]
+    fn output_file_name_strips_only_the_last_extension() {
+        // Edge case: `general.lua.bak` -> stem is `general.lua`. The
+        // user explicitly types this name; preserving everything up
+        // to the final dot is the principle of least surprise.
+        assert_eq!(
+            output_file_name("general.lua.bak", "HOST", "TS"),
+            "general.lua_HOST_TS.json"
         );
     }
 }

@@ -5,3 +5,12 @@
 # Local-only commit message scratch files used by the AI agent
 # (PowerShell has no heredoc, so we round-trip through a temp file).
 .git-commit-msg.tmp
+
+# Inno Setup build artefacts.
+# /publish/        : staging folder for the installer payload (created
+#                    by publish-innosetup.ps1, equivalent to the
+#                    `dotnet publish` output dir in .NET projects).
+# /Setup/Output/   : compiled CollectConfigSetup-<Version>.exe.
+# Both are reproducible from source -- never commit either.
+/publish/
+/Setup/Output/

@@ -27,11 +27,19 @@
 //!
 //! # Return value
 //!
-//! Returns a `WorkerGuard` that the caller MUST keep alive for the
-//! whole duration of the program (typically stored in a `_log_guard`
-//! local in `main`). When the guard is dropped, the non-blocking file
-//! writer's background thread shuts down — any pending log lines still
-//! in the channel are lost.
+//! Returns `(WorkerGuard, PathBuf)`:
+//!
+//! - The `WorkerGuard` MUST be kept alive for the whole duration of
+//!   the program (typically stored in a `_log_guard` local in `main`).
+//!   When the guard is dropped, the non-blocking file writer's
+//!   background thread shuts down — any pending log lines still in the
+//!   channel are lost.
+//! - The `PathBuf` is the resolved log directory. It is returned so
+//!   the caller can colocate other per-run artefacts (e.g. the JSON
+//!   dump that `main` writes next to the rolling log) WITHOUT having
+//!   to re-resolve the directory: a second `resolve_log_dir()` call
+//!   could observe a different value if `RUST_POC_LOG_DIR` changed
+//!   between the two calls.
 
 use std::fs;
 use std::path::PathBuf;
@@ -52,16 +60,16 @@ pub const LOG_DIR_ENV_VAR: &str = "RUST_POC_LOG_DIR";
 pub const LOG_FILE_PREFIX: &str = "rust-poc.log";
 
 /// Installs the global tracing subscriber and returns the file
-/// appender's worker guard.
+/// appender's worker guard alongside the resolved log directory.
 ///
-/// The returned guard is itself `#[must_use]` (upstream contract in
+/// The returned guard is `#[must_use]` (upstream contract in
 /// `tracing-appender`), so we don't re-mark this function — the caller
 /// gets the right diagnostic from the type alone.
 ///
 /// Panics-by-design: if the registry has already been installed, this
 /// call fails. That's intentional — the global subscriber is a
 /// process-wide singleton and double-init is always a bug.
-pub fn init() -> WorkerGuard {
+pub fn init() -> (WorkerGuard, PathBuf) {
     let log_dir = resolve_log_dir();
 
     // Best-effort create. tracing-appender will surface any real
@@ -98,7 +106,7 @@ pub fn init() -> WorkerGuard {
         "logging initialised"
     );
 
-    guard
+    (guard, log_dir)
 }
 
 fn resolve_log_dir() -> PathBuf {
