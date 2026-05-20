@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Greeting",
+  "description": "A request to greet someone in a specific language.\n\n# JSON wire format\n\nWithout nickname: ```json {\"name\": \"Alice\", \"language\": \"english\"} ```\n\nWith nickname: ```json {\"name\": \"Robert\", \"language\": \"french\", \"nickname\": \"Bob\"} ```\n\n`nickname` is omitted entirely from the serialized output when `None`, and absent fields default to `None` on deserialize — so a legacy payload that pre-dates the `nickname` addition still parses cleanly. This is the same `Option` + `skip_serializing_if` pattern used throughout `sdh-fleet-client/contracts/src/fleet_settings.rs`.",
+  "type": "object",
+  "required": [
+    "language",
+    "name"
+  ],
+  "properties": {
+    "language": {
+      "$ref": "#/definitions/Language"
+    },
+    "name": {
+      "type": "string"
+    },
+    "nickname": {
+      "description": "Optional informal name. When present, greeter implementations use it in place of `name`. When absent, falls back to `name`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "Language": {
+      "description": "Language a greeting should be rendered in.\n\nJSON form is the lowercase variant name: `\"english\"` or `\"french\"`.",
+      "type": "string",
+      "enum": [
+        "english",
+        "french"
+      ]
+    }
+  }
+}

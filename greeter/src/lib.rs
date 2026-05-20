@@ -13,21 +13,24 @@ pub trait Greeter {
     fn greet(&self, greeting: &Greeting) -> String;
 }
 
-/// English-language greeter: `Hello, {name}!`.
+/// English-language greeter: `Hello, {display_name}!`.
+///
+/// Uses `Greeting::display_name()` which prefers the nickname when set,
+/// otherwise falls back to the formal `name`.
 pub struct EnglishGreeter;
 
 impl Greeter for EnglishGreeter {
     fn greet(&self, greeting: &Greeting) -> String {
-        format!("Hello, {}!", greeting.name)
+        format!("Hello, {}!", greeting.display_name())
     }
 }
 
-/// French-language greeter: `Bonjour, {name} !`.
+/// French-language greeter: `Bonjour, {display_name} !`.
 pub struct FrenchGreeter;
 
 impl Greeter for FrenchGreeter {
     fn greet(&self, greeting: &Greeting) -> String {
-        format!("Bonjour, {} !", greeting.name)
+        format!("Bonjour, {} !", greeting.display_name())
     }
 }
 
@@ -37,15 +40,21 @@ mod tests {
     use rust_poc_contracts::Language;
 
     #[test]
-    fn english_greeter_outputs_hello() {
+    fn english_greeter_outputs_hello_with_name() {
         let g = Greeting::new("World", Language::English);
         assert_eq!(EnglishGreeter.greet(&g), "Hello, World!");
     }
 
     #[test]
-    fn french_greeter_outputs_bonjour() {
+    fn french_greeter_outputs_bonjour_with_name() {
         let g = Greeting::new("Monde", Language::French);
         assert_eq!(FrenchGreeter.greet(&g), "Bonjour, Monde !");
+    }
+
+    #[test]
+    fn greeter_prefers_nickname_when_present() {
+        let g = Greeting::with_nickname("Robert", Language::English, "Bob");
+        assert_eq!(EnglishGreeter.greet(&g), "Hello, Bob!");
     }
 
     #[test]

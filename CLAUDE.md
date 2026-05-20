@@ -27,13 +27,21 @@ PowerShell experience but is new to Rust. When making changes:
 ## Commands
 
 ```bash
-cargo check                 # Type-check the workspace (~1s, used dozens of times per session)
-cargo clippy -- -D warnings # Lint pedantic + unwrap/expect warnings as errors
-cargo fmt                   # Format to rustfmt defaults
-cargo test                  # Run all unit + integration + doc tests
-cargo run                   # Build + execute the root binary
-cargo build --release       # Optimised final binary in target/release/
+cargo check --workspace --all-targets    # Type-check everything (~1s, used dozens of times per session)
+cargo clippy --workspace --all-targets -- -D warnings  # Lint, warnings as errors
+cargo fmt                                # Format to rustfmt defaults
+cargo test --workspace                   # Unit + integration + doc tests
+cargo run -p rust-poc                    # Build + execute the root binary
+cargo build --release                    # Optimised final binary in target/release/
+
+# Regenerate JSON schemas under contracts/generated/schemas/. Run after
+# any change to a struct or enum in contracts/. Same workflow as
+# sdh-fleet-client/contracts.
+cargo run -p rust-poc-contracts --bin gen-schemas --features schema
 ```
+
+Note: `cargo run` without `-p` fails because the workspace exposes two
+binaries (`rust-poc` and `gen-schemas`). Always pass `-p` at the root.
 
 The pinned toolchain (Rust 1.95.0 + clippy + rustfmt) lives in
 `rust-toolchain.toml` — rustup picks it up automatically on the first
@@ -56,15 +64,45 @@ structure of `sdh-fleet-client`:
   duplicate a struct or enum into `greeter/` or the root bin — extend
   `contracts/` and let the others import. This mirrors the same rule
   in `sdh-fleet-client/contracts/`.
-- **`contracts/` has zero runtime dependencies.** Anything added there
-  ends up in every downstream crate. If serialisation is needed later,
-  add `serde` behind a feature flag rather than unconditionally.
+- **`contracts/` keeps runtime deps minimal.** `serde` + `serde_json`
+  are always-on (they are de-facto stdlib for any wire type). Anything
+  heavier — `schemars`, `tokio`, `reqwest` — goes behind a feature
+  flag, exactly like `sdh-fleet-client/contracts/Cargo.toml`.
 - **`greeter/` exposes behaviour through a trait, never concrete
   types.** The root bin must depend on `Greeter`, not on
   `EnglishGreeter` directly, in any non-trivial dispatch logic.
 - **The root bin is a composer, not a place for logic.** New behaviour
   goes in `greeter/` (or a new sibling crate); `main.rs` only wires
   things together.
+
+### Wire-format discipline
+
+Every struct or enum in `contracts/` that crosses a process boundary
+(JSON file on disk, HTTP body, log payload, …) follows these rules:
+
+- **Always derive `Serialize` + `Deserialize`.** Even if a type is
+  internal today, the derive is cheap and lets the type become wire-
+  visible later without a breaking change.
+- **Never use `#[serde(deny_unknown_fields)]`.** A producer that adds a
+  new field must not break a consumer that hasn't learned about it yet.
+  The default serde behaviour (silently ignore unknown fields) is the
+  forward-compatibility contract.
+- **Optional fields use `Option<T>` + `#[serde(default,
+  skip_serializing_if = "Option::is_none")]`.** This keeps the wire
+  format clean (no `"nickname": null` noise) AND lets legacy payloads
+  without the field parse cleanly.
+- **Enum variants serialize to lowercase by default**
+  (`#[serde(rename_all = "lowercase")]`). Tagged unions use
+  `#[serde(tag = "type", rename_all = "snake_case")]` when needed —
+  same convention as `sdh-fleet-client/contracts/src/agent.rs`.
+- **JSON Schema is generated, not hand-written.** Schemas live in
+  `contracts/generated/schemas/` and are produced by `cargo run -p
+  rust-poc-contracts --bin gen-schemas --features schema`. Re-run after
+  any struct change and commit the diff.
+
+Round-trip tests are the cheapest defence against accidental wire
+breakage — pin the exact JSON string with `assert_eq!`. Several
+examples live in `contracts/src/lib.rs::tests`.
 
 ## Code quality
 

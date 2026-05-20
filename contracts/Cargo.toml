@@ -6,9 +6,26 @@ description = "Shared types used across the workspace — no runtime dependencie
 license = "MIT"
 publish = false
 
-# This crate intentionally has zero dependencies: it owns the types
-# that cross crate boundaries, nothing else. Same constraint as
-# `sdh-fleet-client/contracts/`.
+[features]
+default = []
+# Gates the `schemars` dep + `JsonSchema` derives. Only the `gen-schemas`
+# binary needs this — runtime builds (root bin, greeter) stay lean.
+# Same pattern as `sdh-fleet-client/contracts`.
+schema = ["dep:schemars"]
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pinned exact — schemars 1.x emits draft 2020-12 and changes the field
+# layout, which would break any downstream consumer that pinned the
+# generated schemas. Upgrading is a deliberate migration, not a
+# dependabot bump. Same constraint as `sdh-fleet-client/contracts`.
+schemars   = { version = "=0.8", optional = true }
+
+[[bin]]
+name = "gen-schemas"
+path = "src/bin/gen-schemas.rs"
+required-features = ["schema"]
 
 [lints]
 workspace = true
