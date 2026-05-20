@@ -40,8 +40,12 @@ cargo build --release                    # Optimised final binary in target/rele
 cargo run -p rust-poc-contracts --bin gen-schemas --features schema
 ```
 
-Note: `cargo run` without `-p` fails because the workspace exposes two
-binaries (`rust-poc` and `gen-schemas`). Always pass `-p` at the root.
+Note: `cargo run` at the workspace root launches `rust-poc` thanks to
+the `default-run = "rust-poc"` key in the root `Cargo.toml`. The
+schema generator is **not** the default — it lives in `contracts/`
+and is gated behind the `schema` feature, so it must be invoked
+explicitly via `cargo run -p rust-poc-contracts --bin gen-schemas
+--features schema`.
 
 The pinned toolchain (Rust 1.95.0 + clippy + rustfmt) lives in
 `rust-toolchain.toml` — rustup picks it up automatically on the first
