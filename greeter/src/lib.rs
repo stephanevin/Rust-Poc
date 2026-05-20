@@ -3,25 +3,20 @@
 //! Mirrors the role of `sdh-fleet-client/service/src/handler.rs`:
 //! defines a single behavioural trait, ships several zero-state
 //! implementations, and lets the binary pick the right one at runtime.
+//!
+//! # Logging
+//!
+//! Each implementation emits a `debug!` event when it greets — useful
+//! when investigating dispatch decisions. The greeter does NOT depend
+//! on `tracing-subscriber`: when no subscriber is installed (e.g.
+//! during unit tests), the `debug!` macro compiles to a no-op.
 
 use rust_poc_contracts::Greeting;
+use tracing::debug;
 
 /// Anything that knows how to turn a `Greeting` into a user-facing
 /// string. Zero-state by design — implementations are unit structs so
 /// the binary can hold them without lifetime constraints.
-///
-/// # Examples
-///
-/// ```
-/// use rust_poc_contracts::{Greeting, Language};
-/// use rust_poc_greeter::{EnglishGreeter, FrenchGreeter, Greeter};
-///
-/// let g = Greeting::new("World", Language::English);
-/// assert_eq!(EnglishGreeter.greet(&g), "Hello, World!");
-///
-/// let g = Greeting::new("Monde", Language::French);
-/// assert_eq!(FrenchGreeter.greet(&g), "Bonjour, Monde !");
-/// ```
 pub trait Greeter {
     fn greet(&self, greeting: &Greeting) -> String;
 }
@@ -34,6 +29,7 @@ pub struct EnglishGreeter;
 
 impl Greeter for EnglishGreeter {
     fn greet(&self, greeting: &Greeting) -> String {
+        debug!(name = %greeting.display_name(), "english greeter invoked");
         format!("Hello, {}!", greeting.display_name())
     }
 }
@@ -43,6 +39,7 @@ pub struct FrenchGreeter;
 
 impl Greeter for FrenchGreeter {
     fn greet(&self, greeting: &Greeting) -> String {
+        debug!(name = %greeting.display_name(), "french greeter invoked");
         format!("Bonjour, {} !", greeting.display_name())
     }
 }

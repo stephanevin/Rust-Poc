@@ -40,12 +40,8 @@ cargo build --release                    # Optimised final binary in target/rele
 cargo run -p rust-poc-contracts --bin gen-schemas --features schema
 ```
 
-Note: `cargo run` at the workspace root launches `rust-poc` thanks to
-the `default-run = "rust-poc"` key in the root `Cargo.toml`. The
-schema generator is **not** the default — it lives in `contracts/`
-and is gated behind the `schema` feature, so it must be invoked
-explicitly via `cargo run -p rust-poc-contracts --bin gen-schemas
---features schema`.
+Note: `cargo run` without `-p` fails because the workspace exposes two
+binaries (`rust-poc` and `gen-schemas`). Always pass `-p` at the root.
 
 The pinned toolchain (Rust 1.95.0 + clippy + rustfmt) lives in
 `rust-toolchain.toml` — rustup picks it up automatically on the first
@@ -58,9 +54,9 @@ structure of `sdh-fleet-client`:
 
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
-| **`rust-poc-contracts`** (`contracts/`) | Shared types only. No runtime deps, no I/O. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-greeter`** (`greeter/`) | `Greeter` trait + concrete implementations. | `sdh-fleet-client/service/src/handler.rs` |
-| **`rust-poc`** (root + `src/main.rs`) | Composer — dispatches into greeter impls based on a discriminant in the input. | `sdh-fleet-client/src/main.rs` |
+| **`rust-poc-contracts`** (`contracts/`) | Shared types only. No runtime deps beyond serde, no I/O. | `sdh-fleet-client/contracts/` |
+| **`rust-poc-greeter`** (`greeter/`) | `Greeter` trait + concrete implementations. Emits `debug!` events; depends on `tracing` (not `tracing-subscriber`). | `sdh-fleet-client/service/src/handler.rs` |
+| **`rust-poc`** (root + `src/main.rs` + `src/logging.rs`) | Composer — dispatches into greeter impls and installs the tracing subscriber. | `sdh-fleet-client/src/main.rs` + `src/logging.rs` |
 
 ### Architectural rules
 
@@ -107,6 +103,57 @@ Every struct or enum in `contracts/` that crosses a process boundary
 Round-trip tests are the cheapest defence against accidental wire
 breakage — pin the exact JSON string with `assert_eq!`. Several
 examples live in `contracts/src/lib.rs::tests`.
+
+## Logging
+
+Tracing stack mirrored from `sdh-fleet-client/src/logging.rs`, minus
+the hot-reload machinery (no remote config source means no reason to
+swap filters at runtime). See `src/logging.rs` for the init, plus
+inline `info!` / `debug!` calls in `src/main.rs` and
+`greeter/src/lib.rs` for the call-site idioms.
+
+### Layers
+
+- **Console** (stderr, compact): human-readable during development.
+- **File** (JSON, daily-rolling): machine-readable, one event per
+  line, queryable with `jq`.
+
+Both layers share a single `EnvFilter` that defaults to `INFO` and is
+overridden by `RUST_LOG` (e.g. `RUST_LOG=rust_poc_greeter=debug`).
+
+### Log directory resolution (priority order)
+
+1. `RUST_POC_LOG_DIR` env var, if set. **This is the operator's
+   escape hatch.** On this developer's machine it should be set to
+   `C:\SMSLogs` system-wide:
+   ```powershell
+   [System.Environment]::SetEnvironmentVariable(
+       'RUST_POC_LOG_DIR', 'C:\SMSLogs', 'User')
+   ```
+   (then reopen the terminal so the variable is picked up).
+2. `<directory containing the executable>/logs/` — what production
+   builds use by default. For `cargo run`, this resolves to
+   `target/debug/logs/` or `target/release/logs/`.
+3. `./logs/` relative to the current working directory — last-resort
+   fallback when `std::env::current_exe()` fails (rare).
+
+The resolver itself does **not** validate writability — it just picks
+the path. `tracing-appender` is best-effort and silently drops events
+if the directory turns out to be unwritable, same posture as
+`sdh-fleet-client`.
+
+### Call-site discipline
+
+- `info!(field = value, "human message")` — never interpolate the
+  field into the message string. Structured fields stay queryable.
+- `%expr` for `Display`, `?expr` for `Debug` formatting of a field.
+- Crates that do work (`greeter/`) depend on `tracing` only, not on
+  `tracing-subscriber`. Macros expand to no-ops when no subscriber is
+  installed, which keeps unit tests free of any setup boilerplate.
+- The root binary owns the `WorkerGuard` returned by `logging::init()`
+  in a `_log_guard` local that must live for the whole program.
+  Dropping it kills the non-blocking writer's worker thread and
+  silently loses any pending log lines.
 
 ## Code quality
 

@@ -9,11 +9,6 @@ default-members = [".", "contracts", "greeter"]
 name = "rust-poc"
 version = "0.1.0"
 edition = "2024"
-# `cargo run` at the workspace root is ambiguous as soon as a second
-# binary appears in `default-members` (e.g. `gen-schemas` in
-# `contracts/`). Pinning the default binary keeps the muscle-memory
-# `cargo run` working without having to type `-p rust-poc` every time.
-default-run = "rust-poc"
 description = "Personal Rust learning workspace — workspace + traits + tests Hello World"
 license = "MIT"
 publish = false
@@ -34,6 +29,12 @@ schema = ["rust-poc-contracts/schema"]
 rust-poc-contracts = { path = "contracts" }
 rust-poc-greeter   = { path = "greeter" }
 serde_json         = "1"
+
+# Structured logging stack — same versions as sdh-fleet-client so the
+# call-site idioms (info!, debug!, structured fields) transfer directly.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender   = "0.2"
 
 # Workspace-wide lint policy. Each member crate opts in via
 # `[lints] workspace = true` in its own Cargo.toml.

@@ -1,0 +1,43 @@
+Add structured logging via tracing
+
+Minimalist mapping of the sdh-fleet-client logging stack to this
+workspace. Two layers (compact console on stderr, JSON daily-
+rolling on disk) share a single EnvFilter that defaults to INFO
+and honours RUST_LOG for overrides.
+
+The log directory follows the same three-level resolution as
+sdh-fleet-client/src/logging.rs:
+
+1. RUST_POC_LOG_DIR env var, if set (operator escape hatch).
+2. <exe-dir>/logs/ — what production-style runs use.
+3. ./logs/ relative to CWD as last resort.
+
+Hot-reload is deliberately NOT ported. The fleet-client needs it
+because fleet-config publishes new log levels at runtime; Rust-Poc
+has no such source, so the extra reload::Layer + log_reload worker
+would be unjustified complexity.
+
+Crate-level wiring:
+
+- root crate gains tracing + tracing-subscriber + tracing-appender
+  and owns src/logging.rs and the WorkerGuard.
+- greeter crate gains tracing (only) so its impls can emit debug!
+  events. Without a subscriber installed (unit tests), the macros
+  are no-ops, so test setup stays empty.
+- contracts crate is left alone — pure data types should not log.
+
+Call-site idioms documented in CLAUDE.md:
+
+- info!(field = value, "msg") with structured fields, never
+  interpolated into the message string.
+- %expr for Display, ?expr for Debug.
+- Operator instruction: set RUST_POC_LOG_DIR to C:\SMSLogs at the
+  user level so log output goes to the team's standard location.
+
+Validated locally:
+- cargo fmt --all -- --check
+- cargo clippy --workspace --all-targets --all-features -- -D warnings
+- cargo test --workspace (21 tests, all green)
+- cargo run -p rust-poc (default dir: target/debug/logs/)
+- $env:RUST_POC_LOG_DIR=...; $env:RUST_LOG=debug; cargo run
+  (verified override + debug-level greeter events surface)

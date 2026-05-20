@@ -5,19 +5,27 @@
 //! and produces the user-visible output.
 //!
 //! In addition to plain greetings, this binary demonstrates the
-//! contracts crate's `serde` round-trip: JSON → struct → dispatch →
-//! string. Same shape as the NATS payload path in
-//! `sdh-fleet-client/service/src/handler.rs`, just without the
-//! transport layer.
+//! contracts crate's `serde` round-trip and the workspace logging
+//! stack: every dispatch emits a structured `info!` event that is
+//! mirrored to a compact console writer (stderr) and a JSON file
+//! writer under the log directory (see `logging` module).
+
+mod logging;
 
 use rust_poc_contracts::{Greeting, Language};
 use rust_poc_greeter::{EnglishGreeter, FrenchGreeter, Greeter};
+use tracing::{debug, info};
 
 // `main` returns a `Result` so the `?` operator can propagate
 // `serde_json` errors. Idiomatic Rust 2024 entry-point and the
 // canonical alternative to littering the code with `.unwrap()`.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // --- in-memory greetings, built from typed constructors -----------
+    // `_log_guard` must stay alive for the whole program. When it is
+    // dropped, the non-blocking file writer's worker thread shuts
+    // down and any pending log lines still in its channel are lost.
+    // Same invariant as `sdh-fleet-client/src/main.rs::_log_guard`.
+    let _log_guard = logging::init();
+
     let greetings = [
         Greeting::new("World", Language::English),
         Greeting::with_nickname("Robert", Language::English, "Bob"),
@@ -26,15 +34,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for greeting in &greetings {
         let json = serde_json::to_string(greeting)?;
-        println!("{json:<70}  →  {}", greet(greeting));
+        let output = greet(greeting);
+
+        // Structured event — `name`, `language`, etc. become first-class
+        // JSON fields in the file sink, queryable with `jq` or any log
+        // aggregator. Don't interpolate them into the message string;
+        // keep the message a fixed human-readable label.
+        info!(
+            name = greeting.name,
+            language = ?greeting.language,
+            nickname = ?greeting.nickname,
+            "greeting dispatched"
+        );
+
+        // User-facing stdout output is separate from operational
+        // logging — same separation as a real CLI where stdout is the
+        // contract and logs are diagnostics.
+        println!("{json:<70}  ->  {output}");
     }
 
-    // --- payload arriving from "the wire", parsed back into a struct --
-    // The unknown `future_field` is silently ignored, demonstrating the
-    // forward-compatibility invariant described in
-    // `contracts/src/lib.rs`.
+    // Demonstrate parsing a payload from "the wire" — unknown fields
+    // are silently dropped (see contracts/src/lib.rs invariants).
     let raw = r#"{"name":"Eve","language":"french","future_field":42}"#;
     let parsed: Greeting = serde_json::from_str(raw)?;
+    debug!(?parsed, "parsed payload from wire");
+
     println!("\nParsed from wire: {parsed:?}");
     println!("Dispatched      : {}", greet(&parsed));
 
