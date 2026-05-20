@@ -2,38 +2,11 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "cargo build (debug)",
-      "type": "shell",
-      "command": "cargo",
-      "args": ["build"],
-      "group": { "kind": "build", "isDefault": true },
-      "presentation": { "reveal": "silent", "panel": "shared" },
-      "problemMatcher": ["$rustc"]
-    },
-    {
-      "label": "cargo build (tests)",
-      "type": "shell",
-      "command": "cargo",
-      "args": ["test", "--no-run"],
-      "group": "build",
-      "presentation": { "reveal": "silent", "panel": "shared" },
-      "problemMatcher": ["$rustc"]
-    },
-    {
-      "label": "cargo build (greeter tests)",
-      "type": "shell",
-      "command": "cargo",
-      "args": ["test", "--no-run", "--package=rust-poc-greeter"],
-      "group": "build",
-      "presentation": { "reveal": "silent", "panel": "shared" },
-      "problemMatcher": ["$rustc"]
-    },
-    {
       "label": "cargo check",
       "type": "shell",
       "command": "cargo",
       "args": ["check"],
-      "group": "build",
+      "group": { "kind": "build", "isDefault": true },
       "presentation": { "reveal": "silent", "panel": "shared" },
       "problemMatcher": ["$rustc"]
     },
@@ -42,9 +15,18 @@
       "type": "shell",
       "command": "cargo",
       "args": ["clippy", "--", "-D", "warnings"],
-      "group": "test",
+      "group": "build",
       "presentation": { "reveal": "always", "panel": "shared" },
       "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "cargo fmt",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["fmt"],
+      "group": "build",
+      "presentation": { "reveal": "silent", "panel": "shared" },
+      "problemMatcher": []
     },
     {
       "label": "cargo test",
@@ -52,6 +34,15 @@
       "command": "cargo",
       "args": ["test"],
       "group": { "kind": "test", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "cargo run",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["run"],
+      "group": "build",
       "presentation": { "reveal": "always", "panel": "shared" },
       "problemMatcher": ["$rustc"]
     }

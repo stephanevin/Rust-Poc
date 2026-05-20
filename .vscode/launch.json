@@ -2,41 +2,47 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "type": "cppvsdbg",
+      "type": "lldb",
       "request": "launch",
       "name": "Debug binary 'rust-poc'",
-      "program": "${workspaceFolder}/target/debug/rust-poc.exe",
+      "cargo": {
+        "args": ["build", "--bin=rust-poc"],
+        "filter": { "name": "rust-poc", "kind": "bin" }
+      },
       "args": [],
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "cargo build (debug)",
-      "console": "integratedTerminal"
+      "cwd": "${workspaceFolder}"
     },
     {
-      "type": "cppvsdbg",
+      "type": "lldb",
       "request": "launch",
       "name": "Debug all unit tests in workspace",
-      "program": "${workspaceFolder}/target/debug/deps/${input:testBinary}",
-      "args": ["--nocapture"],
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "cargo build (tests)",
-      "console": "integratedTerminal"
+      "cargo": {
+        "args": ["test", "--no-run"]
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
     },
     {
-      "type": "cppvsdbg",
+      "type": "lldb",
       "request": "launch",
-      "name": "Debug tests in 'rust-poc-greeter'",
-      "program": "${workspaceFolder}/target/debug/deps/${input:testBinary}",
-      "args": ["--nocapture", "--test-threads=1"],
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "cargo build (greeter tests)",
-      "console": "integratedTerminal"
-    }
-  ],
-  "inputs": [
+      "name": "Debug unit tests in 'rust-poc-greeter'",
+      "cargo": {
+        "args": ["test", "--no-run", "--package=rust-poc-greeter"],
+        "filter": { "name": "rust_poc_greeter", "kind": "lib" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
     {
-      "id": "testBinary",
-      "type": "promptString",
-      "description": "Test binary to debug — pick from target/debug/deps/, e.g. rust_poc_greeter-abc123.exe (the suffix changes on each build)"
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in 'rust-poc-contracts'",
+      "cargo": {
+        "args": ["test", "--no-run", "--package=rust-poc-contracts"],
+        "filter": { "name": "rust_poc_contracts", "kind": "lib" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
     }
   ]
 }
