@@ -40,8 +40,19 @@ cargo build --release                    # Optimised final binary in target/rele
 cargo run -p rust-poc-contracts --bin gen-schemas --features schema
 ```
 
-Note: `cargo run` without `-p` fails because the workspace exposes two
-binaries (`rust-poc` and `gen-schemas`). Always pass `-p` at the root.
+Note: `cargo run` at the workspace root launches `rust-poc` thanks to
+the `default-run = "rust-poc"` key in the root `Cargo.toml`. The
+workspace exposes **three** binaries: `rust-poc` (default), `collect-
+config` (`src/bin/collect-config.rs`), and `gen-schemas` (gated behind
+the `schema` feature in `contracts/`). Non-default binaries must be
+invoked explicitly via `--bin <name>` or `-p <crate> --bin <name>`.
+
+**Anti-regression note — DO NOT REWRITE THIS BLOCK CASUALLY.** This
+note has already been silently overwritten twice by AI agents
+reformatting the section. If you are about to delete or rewrite the
+preceding paragraph, the `default-run` key in `Cargo.toml`, or the
+binary list above, you must justify the change in your commit
+message — otherwise restore them verbatim.
 
 The pinned toolchain (Rust 1.95.0 + clippy + rustfmt) lives in
 `rust-toolchain.toml` — rustup picks it up automatically on the first
@@ -233,11 +244,13 @@ returned JSON. Logs and progress go to stderr; only the JSON goes to
 stdout.
 
 Exit codes: `0` success, `1` Lua runtime error (script error or
-timeout), `2` cannot read hostname, `3` cannot serialize output.
+timeout), `2` cannot read hostname, `3` cannot serialize output, `4`
+script path escapes the `collectors/` directory (path traversal
+rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **four** points where copying upstream byte-for-byte
+There are exactly **five** points where copying upstream byte-for-byte
 won't compile. Each one is documented inline at the touch site so a
 future re-sync is mechanical.
 
@@ -421,6 +434,15 @@ seeing the alternative.
   commit history.
 - **Branch policy**: `main` is the default. Feature branches are
   optional for this learning repo.
+- **Preserve prior fixes when editing existing sections.** Before
+  rewriting a block in `CLAUDE.md`, the root `Cargo.toml`, or the
+  Commands section, read the section fully and preserve `Note:`
+  paragraphs, the `default-run` key, `required-features` clauses,
+  feature-gate comments, and inline `FIXME(...)` annotations. The
+  `cargo run` note and `default-run` have each been silently
+  regressed once already (commits `6add5f1` and a later CLAUDE.md
+  rewrite). If you delete an existing comment block, justify it in
+  the commit message; otherwise restore it.
 
 ## Language
 

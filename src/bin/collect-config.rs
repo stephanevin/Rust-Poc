@@ -18,8 +18,16 @@
 //! cargo run --bin collect-config -- general.lua > config.json
 //! cargo run --bin collect-config -- general.lua | jq '.machine_name'
 //! ```
+//!
+//! ## Exit codes
+//!
+//! - `0` — success
+//! - `1` — Lua runtime error (script error, missing file at run time, timeout)
+//! - `2` — cannot read hostname
+//! - `3` — cannot serialize Lua output to JSON
+//! - `4` — script path escapes the `collectors/` directory (path traversal rejected)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -36,6 +44,15 @@ async fn main() -> ExitCode {
     let perimeter = args.get(2).map(String::as_str);
 
     let cache_dir = PathBuf::from("collectors");
+
+    // Reject any script path that would escape ./collectors/ before we
+    // hand the string to InternalRuntime::run. The engine itself
+    // (verbatim port from sdh-fleet-client) trusts its caller — the
+    // trust boundary for user input lives here, in the CLI.
+    if let Err(e) = resolve_script_path(&cache_dir, &script) {
+        eprintln!("collect-config: {e}");
+        return ExitCode::from(4);
+    }
 
     // `hostname::get` is the cross-platform way to read the machine
     // name (GetComputerNameW on Windows, gethostname() on Unix). The
@@ -73,5 +90,75 @@ async fn main() -> ExitCode {
             eprintln!("collect-config: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Resolves `script` against `cache_dir` and guarantees the result stays
+/// strictly inside the canonicalised `cache_dir`. Returns the canonical
+/// script path on success.
+///
+/// `Path::join` has a well-known footgun: when the joined component is
+/// an absolute path, it REPLACES the base instead of appending to it.
+/// A naive `cache_dir.join(script)` would therefore let an attacker
+/// pass `C:\Windows\System32\anything.lua` and the runtime would
+/// happily read it. Canonicalising both sides and asserting the
+/// `starts_with` invariant closes that loophole as well as the more
+/// classic `../../escape.lua` pattern.
+fn resolve_script_path(cache_dir: &Path, script: &str) -> Result<PathBuf, String> {
+    let cache_root = cache_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot canonicalize {}: {e}", cache_dir.display()))?;
+
+    let candidate = cache_dir
+        .join(script)
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve script path {script}: {e}"))?;
+
+    if !candidate.starts_with(&cache_root) {
+        return Err(format!(
+            "script path {script} escapes {}",
+            cache_dir.display()
+        ));
+    }
+
+    Ok(candidate)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // These tests rely on the workspace shipping `collectors/general.lua`
+    // and a `Cargo.toml` at the package root, both of which are tracked
+    // in git. `cargo test --bin collect-config` runs from the package
+    // root, so the relative paths below resolve.
+
+    #[test]
+    fn accepts_a_script_inside_the_cache_directory() {
+        let result = resolve_script_path(Path::new("collectors"), "general.lua");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn rejects_parent_directory_traversal() {
+        let result = resolve_script_path(Path::new("collectors"), "../Cargo.toml");
+        assert!(
+            result.is_err(),
+            "expected Err for ../Cargo.toml, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_absolute_path_outside_the_cache() {
+        // CWD/Cargo.toml exists but lives outside ./collectors. The
+        // canonicalize step succeeds; the starts_with check is what
+        // must reject the candidate.
+        let absolute = std::env::current_dir().unwrap().join("Cargo.toml");
+        let result = resolve_script_path(Path::new("collectors"), absolute.to_str().unwrap());
+        assert!(
+            result.is_err(),
+            "expected Err for {absolute:?}, got {result:?}"
+        );
     }
 }
