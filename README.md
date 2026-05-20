@@ -4,6 +4,11 @@ Workspace Rust personnel — premier "Hello World" structuré sur le même squel
 
 Objectif : apprendre les idiomes Rust (workspace multi-crates, trait + impls, tests intégrés, clippy pedantic) sans la complexité d'un projet réel (async, NATS, cross-platform).
 
+> **AI coding agents**: read [`CLAUDE.md`](CLAUDE.md) first. It defines the
+> conventions, lint policy, and the "act as a senior dev partner" guidance
+> inherited from `sdh-fleet-client`. [`AGENTS.md`](AGENTS.md) points to the
+> same file for tools that look there.
+
 ## Structure
 
 ```
