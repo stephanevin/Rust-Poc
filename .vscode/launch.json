@@ -1,0 +1,42 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "cppvsdbg",
+      "request": "launch",
+      "name": "Debug binary 'rust-poc'",
+      "program": "${workspaceFolder}/target/debug/rust-poc.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build (debug)",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "cppvsdbg",
+      "request": "launch",
+      "name": "Debug all unit tests in workspace",
+      "program": "${workspaceFolder}/target/debug/deps/${input:testBinary}",
+      "args": ["--nocapture"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build (tests)",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "cppvsdbg",
+      "request": "launch",
+      "name": "Debug tests in 'rust-poc-greeter'",
+      "program": "${workspaceFolder}/target/debug/deps/${input:testBinary}",
+      "args": ["--nocapture", "--test-threads=1"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build (greeter tests)",
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "testBinary",
+      "type": "promptString",
+      "description": "Test binary to debug — pick from target/debug/deps/, e.g. rust_poc_greeter-abc123.exe (the suffix changes on each build)"
+    }
+  ]
+}
