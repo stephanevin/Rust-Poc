@@ -49,14 +49,15 @@ The pinned toolchain (Rust 1.95.0 + clippy + rustfmt) lives in
 
 ## Architecture
 
-Three sibling crates in one workspace, modelled on the cross-boundary
+Four sibling crates in one workspace, modelled on the cross-boundary
 structure of `sdh-fleet-client`:
 
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Shared types only. No runtime deps beyond serde, no I/O. | `sdh-fleet-client/contracts/` |
 | **`rust-poc-greeter`** (`greeter/`) | `Greeter` trait + concrete implementations. Emits `debug!` events; depends on `tracing` (not `tracing-subscriber`). | `sdh-fleet-client/service/src/handler.rs` |
-| **`rust-poc`** (root + `src/main.rs` + `src/logging.rs`) | Composer — dispatches into greeter impls and installs the tracing subscriber. | `sdh-fleet-client/src/main.rs` + `src/logging.rs` |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 17 `host.*` bindings (WMI, registry, networking, ADSI). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc`** (root + `src/main.rs` + `src/bin/collect-config.rs`) | Composer — dispatches into greeter impls, installs the tracing subscriber, and exposes the `collect-config` CLI that drives `rust-poc-lua`. | `sdh-fleet-client/src/main.rs` + `src/logging.rs` |
 
 ### Architectural rules
 
@@ -154,6 +155,188 @@ if the directory turns out to be unwritable, same posture as
   in a `_log_guard` local that must live for the whole program.
   Dropping it kills the non-blocking writer's worker thread and
   silently loses any pending log lines.
+
+## Lua collector runtime
+
+The `rust-poc-lua/` crate is a **verbatim port** of
+`sdh-fleet-client/lua/` from the sibling repo
+(`C:\Users\Vin\source\repos\sdh\sdh-fleet\sdh-fleet-client\lua\`). The
+goal is pedagogical — read and run the production code line-for-line
+instead of re-implementing a subset, so future upgrades flow naturally
+from the upstream crate via a `Copy-Item`.
+
+Same file names, same module boundaries, same comments. The only
+intentional deviations from a strict `cp -r` are documented below.
+
+### Source layout (mirrors upstream)
+
+```
+rust-poc-lua/src/
+├── lib.rs          # Public API + non-Windows stub
+├── runtime.rs      # InternalRuntime::run — async, tokio::spawn_blocking + timeout
+├── sandbox.rs      # Strips io/dofile/require/etc. globals
+├── host.rs         # 17 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── wmi.rs          # COMLibrary + WMIConnection + per-class cache
+├── registry.rs     # RegOpenKeyExW + RegQueryValueExW + REG_* decode
+├── net.rs          # GetAdaptersAddresses + IPv4 enumeration
+├── winver.rs       # RtlGetVersion + GetFirmwareType
+├── eventlog.rs     # Install date (registry-derived ISO 8601)
+└── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
+```
+
+### The 17 `host.*` bindings exposed to Lua
+
+| Binding | Backend | Surface |
+|---|---|---|
+| `host.env(name)` | `std::env::var` + injected `SDH_HOSTNAME` / `SDH_CLIENT_VERSION` / `SDH_PERIMETER` | `string?` |
+| `host.now_iso8601()` | `eventlog::install_info()["install_date"]` | `string?` |
+| `host.wmi_query(class, prop)` | `WMIConnection::raw_query` (cached per class) | `any?` |
+| `host.wmi_all(class)` | `WMIConnection::raw_query` | `array<object>?` |
+| `host.registry_read(hive, key, value)` | `RegOpenKeyExW` + decode (SZ / DWORD / QWORD / MULTI_SZ) | `string \| number \| array?` |
+| `host.rtl_get_version()` | `RtlGetVersion` | `{major, minor, build}?` |
+| `host.get_firmware_type()` | `GetFirmwareType` | `"UEFI" \| "BIOS" \| nil` |
+| `host.net_interfaces()` | `GetAdaptersAddresses` (loopback filtered) | `array<{name, ipv4[]}>?` |
+| `host.adsi_user_mail(timeout_s)` | ADSI stub (returns nil unless USERDNSDOMAIN is set) | `string?` |
+| `host.setup_history()` | `eventlog::install_info` | `{install_date, history[]}` |
+| `host.cpu_details()` | WMI `Win32_Processor.Name + SocketDesignation` | `string?` |
+| `host.ram_total()` | WMI `Win32_PhysicalMemory.Capacity` (summed) | `number?` |
+| `host.disk_size(target, property)` | WMI `Win32_LogicalDisk` filtered by `%SystemDrive%` | `number?` |
+| `host.motherboard_details()` | WMI `Win32_ComputerSystem.Model + SystemFamily` | `string?` |
+| `host.bios_details()` | WMI `Win32_BIOS.BIOSVersion` + `winver::firmware_type` | `string?` |
+| `host.desktop_resolution()` | WMI `Win32_VideoController.{Current*Resolution, RefreshRate}` | `string?` |
+| `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
+
+Bindings never raise — failures are recorded into `host.errors()` and
+the binding returns `nil`. The Lua script attaches the final
+`host.errors()` map as `_errors` in its output for the operator to
+inspect.
+
+### `collect-config` CLI
+
+```powershell
+# Run the bundled general.lua collector against the local host
+cargo run --bin collect-config -- general.lua
+
+# Optional perimeter argument (surfaces as host.env("SDH_PERIMETER"))
+cargo run --bin collect-config -- general.lua some-perimeter
+
+# stdout-only JSON, suitable for piping
+cargo run --quiet --bin collect-config -- general.lua > config.json
+cargo run --quiet --bin collect-config -- general.lua | jq '.machine_name'
+```
+
+The binary lives at `src/bin/collect-config.rs`. It loads
+`collectors/<script_name>` (the cache dir is hard-coded to
+`./collectors`), constructs an `InternalRuntime`, calls
+`runtime.run(...)` with a 30s wall-clock timeout, and pretty-prints the
+returned JSON. Logs and progress go to stderr; only the JSON goes to
+stdout.
+
+Exit codes: `0` success, `1` Lua runtime error (script error or
+timeout), `2` cannot read hostname, `3` cannot serialize output.
+
+### Deviations from a strict verbatim copy
+
+There are exactly **four** points where copying upstream byte-for-byte
+won't compile. Each one is documented inline at the touch site so a
+future re-sync is mechanical.
+
+1. **`rust-poc-lua/Cargo.toml` — package name**
+   `name = "sdh-fleet-lua"` → `name = "rust-poc-lua"`.
+
+2. **`rust-poc-lua/Cargo.toml` — lints policy**
+   The upstream local `[lints.clippy] pedantic = ...` block is replaced
+   by `[lints] workspace = true`. The workspace policy in the root
+   `Cargo.toml` is byte-identical (`pedantic` + `unwrap_used` +
+   `expect_used` at `warn`) — just attached one level up instead of
+   inline.
+
+3. **`rust-poc-lua/Cargo.toml` — tokio `fs` feature**
+   `tokio` gains the `fs` feature because `runtime.rs` uses
+   `tokio::fs::read_to_string`. In the sdh-fleet-client workspace this
+   compiles because another crate's tokio dep activates `fs` and Cargo
+   unifies features across the workspace. Adding `fs` explicitly here
+   keeps `cargo check -p rust-poc-lua` working in isolation.
+
+4. **`rust-poc-lua/src/lib.rs` — broken intra-doc link**
+   Upstream references `[`sdh_fleet_contracts::host_api::HOST_API`]`
+   (rustdoc link). The `sdh-fleet-contracts` crate doesn't exist here,
+   so the link would fail to resolve and break `cargo doc`. Replaced
+   with a plain prose reference (with backticks around `HOST_API` so
+   `clippy::doc_markdown` stays quiet).
+
+5. **`rust-poc-lua/src/sandbox.rs` — `#[allow(clippy::map_unwrap_or)]`**
+   Rust 1.95 + `pedantic` warns on `.map(<f>).unwrap_or(<a>)` and
+   suggests `.map_or(<a>, <f>)`. Upstream has the same pattern but its
+   CI doesn't gate on this lint yet, so the warning slipped through.
+   Added a targeted `#[allow]` (with a FIXME comment) instead of
+   refactoring, so a future `Copy-Item` from upstream stays a one-liner
+   diff. Drop the `#[allow]` once upstream refactors the closure.
+
+Everything else — module names, function bodies, comments, doc
+strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is
+byte-identical to upstream.
+
+### Re-syncing a file after an upstream change
+
+```powershell
+# Diff a single file against upstream
+git diff --no-index `
+  C:\Users\Vin\source\repos\sdh\sdh-fleet\sdh-fleet-client\lua\src\host.rs `
+  C:\Users\Vin\source\repos\Rust-Poc\rust-poc-lua\src\host.rs
+
+# Overwrite a single file with upstream (safe for everything EXCEPT lib.rs)
+Copy-Item -Force `
+  C:\Users\Vin\source\repos\sdh\sdh-fleet\sdh-fleet-client\lua\src\host.rs `
+  C:\Users\Vin\source\repos\Rust-Poc\rust-poc-lua\src\host.rs
+
+# lib.rs needs hand-merging because of deviation #4 (the broken doc-link
+# would come back). The other 9 files are all safe to overwrite.
+```
+
+After a re-sync: `cargo check -p rust-poc-lua` + `cargo clippy -p
+rust-poc-lua` + `cargo run --bin collect-config -- general.lua`.
+
+### New Rust concepts surfaced by this crate
+
+Things that don't appear elsewhere in the workspace and are worth
+studying when the crate's source rolls past:
+
+- **`async fn` + `tokio::task::spawn_blocking` + `tokio::time::timeout`**
+  — `mlua::Lua` is `!Send`, so the VM has to live on a blocking thread.
+  The wall-clock bound is enforced by wrapping the `JoinHandle` in
+  `timeout`. (Tokio docs, Book §16 on async.)
+- **`Rc<RefCell<HostState>>`** in `host.rs` — every Lua binding closure
+  needs a mutable handle to the same `HostState`. Shared ownership +
+  interior mutability is the idiom. (Book §15.5.)
+- **`#[cfg(windows)]`** at the module level in `lib.rs` — the real
+  implementation only compiles on Windows; other targets get a stub
+  with the same public surface. (Reference: conditional compilation.)
+- **FFI to Win32** via the `windows` crate — `unsafe { ... }` blocks
+  with `// SAFETY:` justifications in `registry.rs`, `net.rs`,
+  `winver.rs`. (Book §19.1 on unsafe Rust.)
+- **COM/WMI** via the `wmi` crate — `COMLibrary::new` initialises COM,
+  `WMIConnection::raw_query` runs typed-via-serde queries against
+  `root\cimv2`.
+- **mlua public traits** — `IntoLua` / `FromLua` / `LuaSerdeExt::to_value`
+  / `Function::call` / `lua.create_function`. Closures captured into
+  bindings need `'static` lifetimes, hence the `Rc` clones.
+- **Sandboxing Lua by global removal** — `lua.globals().set(name, Nil)`
+  in `sandbox.rs`. Cheap, declarative, no `unsafe` needed.
+- **Vendored C deps** — `mlua` feature `vendored` builds Lua 5.4 from
+  C sources at compile time. First build is slow (~30s+); incremental
+  builds are normal.
+
+### Known stubs left intentionally incomplete
+
+- `ad::current_user_mail_blocking` — always returns `None` even on
+  domain-joined machines. Phase 2 in upstream too. Real impl needs
+  `IADs::Get("mail")` via `windows::Win32::System::Ole`.
+- `eventlog::install_info().history` — always `[]`. Real impl needs
+  `EvtQuery` + `EvtRender` to parse the Setup event log.
+
+Both stubs are documented in their source files. They surface as `null`
+or `[]` in the JSON output, never as errors.
 
 ## Code quality
 
