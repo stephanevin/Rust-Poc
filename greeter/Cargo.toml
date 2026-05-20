@@ -1,0 +1,13 @@
+[package]
+name = "rust-poc-greeter"
+version = "0.1.0"
+edition = "2024"
+description = "Greeter trait + per-language implementations"
+license = "MIT"
+publish = false
+
+[dependencies]
+rust-poc-contracts = { path = "../contracts" }
+
+[lints]
+workspace = true

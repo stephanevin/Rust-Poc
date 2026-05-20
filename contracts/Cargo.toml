@@ -1,0 +1,14 @@
+[package]
+name = "rust-poc-contracts"
+version = "0.1.0"
+edition = "2024"
+description = "Shared types used across the workspace — no runtime dependencies"
+license = "MIT"
+publish = false
+
+# This crate intentionally has zero dependencies: it owns the types
+# that cross crate boundaries, nothing else. Same constraint as
+# `sdh-fleet-client/contracts/`.
+
+[lints]
+workspace = true

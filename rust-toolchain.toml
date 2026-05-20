@@ -1,0 +1,6 @@
+[toolchain]
+# Pin the exact compiler version used by the workspace so contributors
+# get identical diagnostics, lints, and behaviour regardless of what
+# their machine-wide rustup default points at.
+channel    = "1.95.0"
+components = ["clippy", "rustfmt"]
