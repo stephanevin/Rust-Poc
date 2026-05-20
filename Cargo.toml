@@ -12,15 +12,18 @@ edition = "2024"
 # `cargo run` at the workspace root is ambiguous as soon as a second
 # binary appears in `default-members` (e.g. `gen-schemas` in
 # `contracts/`). Pinning the default binary keeps the muscle-memory
-# `cargo run` working without having to type `-p rust-poc` every time.
-# Lost once in commit 6add5f1 — restored here.
-default-run = "rust-poc"
-description = "Personal Rust learning workspace — workspace + traits + tests Hello World"
+# `cargo run` working without having to type `--bin` every time.
+default-run = "collect-config"
+description = "Personal Rust learning workspace — in-process Lua 5.4 collector driving rust-poc-lua"
 license = "MIT"
 publish = false
 
 [[bin]]
-name = "rust-poc"
+# Binary name differs from the package name: the artifact identifies
+# itself as the tool ("collect-config") while the package keeps the
+# repo's identity ("rust-poc"). Same idiom as `cargo-edit` shipping
+# `cargo-add` / `cargo-rm` from a package called `cargo-edit`.
+name = "collect-config"
 path = "src/main.rs"
 
 [features]
