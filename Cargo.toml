@@ -1,18 +1,19 @@
 [workspace]
-members = ["contracts", "greeter", "rust-poc-lua"]
+members = ["contracts", "rust-poc-lua"]
 # `default-members` is the set used by `cargo build` / `cargo test`
 # at the workspace root when no `-p` flag is passed. Mirrors the same
 # convention as `sdh-fleet/sdh-fleet-client/Cargo.toml`.
-default-members = [".", "contracts", "greeter", "rust-poc-lua"]
+default-members = [".", "contracts", "rust-poc-lua"]
 
 [package]
 name = "rust-poc"
 version = "0.1.0"
 edition = "2024"
 # `cargo run` at the workspace root is ambiguous as soon as a second
-# binary appears in `default-members` (e.g. `gen-schemas` in
-# `contracts/`). Pinning the default binary keeps the muscle-memory
-# `cargo run` working without having to type `--bin` every time.
+# binary appears in `default-members`. Pinning the default binary
+# keeps the muscle-memory `cargo run` working without having to type
+# `--bin` every time. Currently only one binary lives in the workspace
+# (`collect-config`) so this is also future-proofing.
 default-run = "collect-config"
 description = "Personal Rust learning workspace — in-process Lua 5.4 collector driving rust-poc-lua"
 license = "MIT"
@@ -26,17 +27,8 @@ publish = false
 name = "collect-config"
 path = "src/main.rs"
 
-[features]
-default = []
-# Propagates down to the contracts crate so a single
-# `cargo build --features schema` from the workspace root unlocks the
-# `gen-schemas` binary. Same wiring as
-# `sdh-fleet-client/Cargo.toml` → contracts feature passthrough.
-schema = ["rust-poc-contracts/schema"]
-
 [dependencies]
 rust-poc-contracts = { path = "contracts" }
-rust-poc-greeter   = { path = "greeter" }
 rust-poc-lua       = { path = "rust-poc-lua" }
 serde_json         = "1"
 
@@ -46,7 +38,7 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender   = "0.2"
 
-# Used by the `collect-config` binary (src/bin/collect-config.rs).
+# Used by the `collect-config` binary (src/main.rs).
 # `InternalRuntime::run` is async + uses `tokio::task::spawn_blocking` +
 # `tokio::time::timeout`, so the binary needs a multi-thread runtime.
 # `hostname` provides the machine name in a cross-platform way (we pass

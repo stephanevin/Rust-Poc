@@ -27,32 +27,30 @@ PowerShell experience but is new to Rust. When making changes:
 ## Commands
 
 ```bash
-cargo check --workspace --all-targets    # Type-check everything (~1s, used dozens of times per session)
+cargo check --workspace --all-targets        # Type-check everything (~1s, used dozens of times per session)
 cargo clippy --workspace --all-targets -- -D warnings  # Lint, warnings as errors
-cargo fmt                                # Format to rustfmt defaults
-cargo test --workspace                   # Unit + integration + doc tests
-cargo run -p rust-poc                    # Build + execute the root binary
-cargo build --release                    # Optimised final binary in target/release/
-
-# Regenerate JSON schemas under contracts/generated/schemas/. Run after
-# any change to a struct or enum in contracts/. Same workflow as
-# sdh-fleet-client/contracts.
-cargo run -p rust-poc-contracts --bin gen-schemas --features schema
+cargo fmt --all                              # Format to rustfmt defaults
+cargo test --workspace                       # Unit + integration + doc tests
+cargo run                                    # Build + execute collect-config on ./collectors/general.lua
+cargo run -- general.lua some-perimeter      # Pass script + perimeter args explicitly
+cargo build --release                        # Optimised final binary in target/release/collect-config.exe
 ```
 
-Note: `cargo run` at the workspace root launches `rust-poc` thanks to
-the `default-run = "rust-poc"` key in the root `Cargo.toml`. The
-workspace exposes **three** binaries: `rust-poc` (default), `collect-
-config` (`src/bin/collect-config.rs`), and `gen-schemas` (gated behind
-the `schema` feature in `contracts/`). Non-default binaries must be
-invoked explicitly via `--bin <name>` or `-p <crate> --bin <name>`.
+Note: `cargo run` at the workspace root launches `collect-config`
+thanks to the `default-run = "collect-config"` key in the root
+`Cargo.toml`. The workspace currently exposes a **single** binary
+(`collect-config`, produced from `src/main.rs` via a `[[bin]]` block
+that pins the artifact name independently of the package name).
+`default-run` is also future-proofing — adding a second binary later
+keeps `cargo run` deterministic.
 
 **Anti-regression note — DO NOT REWRITE THIS BLOCK CASUALLY.** This
 note has already been silently overwritten twice by AI agents
 reformatting the section. If you are about to delete or rewrite the
 preceding paragraph, the `default-run` key in `Cargo.toml`, or the
-binary list above, you must justify the change in your commit
-message — otherwise restore them verbatim.
+`[[bin]] name = "collect-config"` line that pins the artifact name,
+you must justify the change in your commit message — otherwise
+restore them verbatim.
 
 The pinned toolchain (Rust 1.95.0 + clippy + rustfmt) lives in
 `rust-toolchain.toml` — rustup picks it up automatically on the first
@@ -60,69 +58,68 @@ The pinned toolchain (Rust 1.95.0 + clippy + rustfmt) lives in
 
 ## Architecture
 
-Four sibling crates in one workspace, modelled on the cross-boundary
+Three sibling crates in one workspace, modelled on the cross-boundary
 structure of `sdh-fleet-client`:
 
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
-| **`rust-poc-contracts`** (`contracts/`) | Shared types only. No runtime deps beyond serde, no I/O. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-greeter`** (`greeter/`) | `Greeter` trait + concrete implementations. Emits `debug!` events; depends on `tracing` (not `tracing-subscriber`). | `sdh-fleet-client/service/src/handler.rs` |
+| **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
 | **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 17 `host.*` bindings (WMI, registry, networking, ADSI). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
-| **`rust-poc`** (root + `src/main.rs` + `src/bin/collect-config.rs`) | Composer — dispatches into greeter impls, installs the tracing subscriber, and exposes the `collect-config` CLI that drives `rust-poc-lua`. | `sdh-fleet-client/src/main.rs` + `src/logging.rs` |
+| **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
 
 - **`contracts/` is the only place a cross-crate type lives.** Never
-  duplicate a struct or enum into `greeter/` or the root bin — extend
-  `contracts/` and let the others import. This mirrors the same rule
-  in `sdh-fleet-client/contracts/`.
+  define a struct or enum directly in the root bin or in
+  `rust-poc-lua/` if it's meant to cross a process boundary — extend
+  `contracts/` and let the others import. Even with the crate
+  currently empty, the invariant stands. Same rule as in
+  `sdh-fleet-client/contracts/`.
 - **`contracts/` keeps runtime deps minimal.** `serde` + `serde_json`
   are always-on (they are de-facto stdlib for any wire type). Anything
   heavier — `schemars`, `tokio`, `reqwest` — goes behind a feature
-  flag, exactly like `sdh-fleet-client/contracts/Cargo.toml`.
-- **`greeter/` exposes behaviour through a trait, never concrete
-  types.** The root bin must depend on `Greeter`, not on
-  `EnglishGreeter` directly, in any non-trivial dispatch logic.
-- **The root bin is a composer, not a place for logic.** New behaviour
-  goes in `greeter/` (or a new sibling crate); `main.rs` only wires
-  things together.
+  flag if it ever returns, exactly like
+  `sdh-fleet-client/contracts/Cargo.toml`.
+- **The root bin is a composer, not a place for logic.** It owns the
+  CLI surface (arg parsing, exit codes, stdout vs stderr discipline)
+  and the logging stack; everything else lives in a sibling crate.
+  When the script-loading or sandbox logic needs to evolve, it
+  evolves in `rust-poc-lua/`, not in `src/main.rs`.
 
 ### Wire-format discipline
 
-Every struct or enum in `contracts/` that crosses a process boundary
-(JSON file on disk, HTTP body, log payload, …) follows these rules:
+Rules for any struct or enum added to `contracts/` that crosses a
+process boundary (JSON file on disk, HTTP body, log payload, …). They
+were enforced on the original Hello World types and stay in force for
+whatever lands next:
 
 - **Always derive `Serialize` + `Deserialize`.** Even if a type is
   internal today, the derive is cheap and lets the type become wire-
   visible later without a breaking change.
-- **Never use `#[serde(deny_unknown_fields)]`.** A producer that adds a
-  new field must not break a consumer that hasn't learned about it yet.
-  The default serde behaviour (silently ignore unknown fields) is the
-  forward-compatibility contract.
+- **Never use `#[serde(deny_unknown_fields)]`.** A producer that adds
+  a new field must not break a consumer that hasn't learned about it
+  yet. The default serde behaviour (silently ignore unknown fields)
+  is the forward-compatibility contract.
 - **Optional fields use `Option<T>` + `#[serde(default,
   skip_serializing_if = "Option::is_none")]`.** This keeps the wire
-  format clean (no `"nickname": null` noise) AND lets legacy payloads
+  format clean (no `"field": null` noise) AND lets legacy payloads
   without the field parse cleanly.
 - **Enum variants serialize to lowercase by default**
   (`#[serde(rename_all = "lowercase")]`). Tagged unions use
   `#[serde(tag = "type", rename_all = "snake_case")]` when needed —
   same convention as `sdh-fleet-client/contracts/src/agent.rs`.
-- **JSON Schema is generated, not hand-written.** Schemas live in
-  `contracts/generated/schemas/` and are produced by `cargo run -p
-  rust-poc-contracts --bin gen-schemas --features schema`. Re-run after
-  any struct change and commit the diff.
 
 Round-trip tests are the cheapest defence against accidental wire
-breakage — pin the exact JSON string with `assert_eq!`. Several
-examples live in `contracts/src/lib.rs::tests`.
+breakage — pin the exact JSON string with `assert_eq!`. Reintroduce
+that pattern as soon as a non-trivial type lands.
 
 ## Logging
 
 Tracing stack mirrored from `sdh-fleet-client/src/logging.rs`, minus
 the hot-reload machinery (no remote config source means no reason to
-swap filters at runtime). See `src/logging.rs` for the init, plus
-inline `info!` / `debug!` calls in `src/main.rs` and
-`greeter/src/lib.rs` for the call-site idioms.
+swap filters at runtime). See `src/logging.rs` for the init and
+`rust-poc-lua/src/*.rs` for the `debug!` / `info!` call-sites that
+surface during a collector run.
 
 ### Layers
 
@@ -131,7 +128,8 @@ inline `info!` / `debug!` calls in `src/main.rs` and
   line, queryable with `jq`.
 
 Both layers share a single `EnvFilter` that defaults to `INFO` and is
-overridden by `RUST_LOG` (e.g. `RUST_LOG=rust_poc_greeter=debug`).
+overridden by `RUST_LOG` (e.g. `RUST_LOG=rust_poc_lua=debug` to see
+every `host.*` binding call from the collector).
 
 ### Log directory resolution (priority order)
 
@@ -159,9 +157,9 @@ if the directory turns out to be unwritable, same posture as
 - `info!(field = value, "human message")` — never interpolate the
   field into the message string. Structured fields stay queryable.
 - `%expr` for `Display`, `?expr` for `Debug` formatting of a field.
-- Crates that do work (`greeter/`) depend on `tracing` only, not on
-  `tracing-subscriber`. Macros expand to no-ops when no subscriber is
-  installed, which keeps unit tests free of any setup boilerplate.
+- Crates that do work (`rust-poc-lua/`) depend on `tracing` only, not
+  on `tracing-subscriber`. Macros expand to no-ops when no subscriber
+  is installed, which keeps unit tests free of any setup boilerplate.
 - The root binary owns the `WorkerGuard` returned by `logging::init()`
   in a `_log_guard` local that must live for the whole program.
   Dropping it kills the non-blocking writer's worker thread and
@@ -226,22 +224,24 @@ inspect.
 
 ```powershell
 # Run the bundled general.lua collector against the local host
-cargo run --bin collect-config -- general.lua
+cargo run
 
-# Optional perimeter argument (surfaces as host.env("SDH_PERIMETER"))
-cargo run --bin collect-config -- general.lua some-perimeter
+# Optional script + perimeter arguments (perimeter surfaces as
+# host.env("SDH_PERIMETER"))
+cargo run -- general.lua some-perimeter
 
-# stdout-only JSON, suitable for piping
-cargo run --quiet --bin collect-config -- general.lua > config.json
-cargo run --quiet --bin collect-config -- general.lua | jq '.machine_name'
+# Pipe-friendly: only the JSON goes to stdout, logs/progress to stderr
+cargo run --quiet > config.json
+cargo run --quiet | jq '.machine_name'
 ```
 
-The binary lives at `src/bin/collect-config.rs`. It loads
-`collectors/<script_name>` (the cache dir is hard-coded to
-`./collectors`), constructs an `InternalRuntime`, calls
-`runtime.run(...)` with a 30s wall-clock timeout, and pretty-prints the
-returned JSON. Logs and progress go to stderr; only the JSON goes to
-stdout.
+The binary lives at `src/main.rs` and is produced as
+`target/debug/collect-config.exe`. It installs the tracing subscriber,
+validates the script path via `resolve_script_path` (canonicalise +
+`starts_with` to refuse traversal), constructs an `InternalRuntime`,
+calls `runtime.run(...)` with a 30s wall-clock timeout, and pretty-
+prints the returned JSON. Logs and progress go to stderr; only the
+JSON goes to stdout.
 
 Exit codes: `0` success, `1` Lua runtime error (script error or
 timeout), `2` cannot read hostname, `3` cannot serialize output, `4`
@@ -308,7 +308,7 @@ Copy-Item -Force `
 ```
 
 After a re-sync: `cargo check -p rust-poc-lua` + `cargo clippy -p
-rust-poc-lua` + `cargo run --bin collect-config -- general.lua`.
+rust-poc-lua` + `cargo run -- general.lua`.
 
 ### New Rust concepts surfaced by this crate
 
@@ -429,9 +429,9 @@ seeing the alternative.
   locally; the owner decides when to actually run `git commit`. The
   same applies to `git push` once a remote is configured.
 - **Commit messages**: one-line subject in imperative mood ("Add
-  Spanish greeter"), optional blank line + body explaining the *why*,
-  not the *what*. Match the style of `sdh-fleet/sdh-fleet-client`
-  commit history.
+  network-share collector"), optional blank line + body explaining
+  the *why*, not the *what*. Match the style of
+  `sdh-fleet/sdh-fleet-client` commit history.
 - **Branch policy**: `main` is the default. Feature branches are
   optional for this learning repo.
 - **Preserve prior fixes when editing existing sections.** Before
