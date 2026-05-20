@@ -9,6 +9,12 @@ default-members = [".", "contracts", "greeter"]
 name = "rust-poc"
 version = "0.1.0"
 edition = "2024"
+# `cargo run` at the workspace root is ambiguous as soon as a second
+# binary appears in `default-members` (e.g. `gen-schemas` in
+# `contracts/`). Pinning the default binary keeps the muscle-memory
+# `cargo run` working without having to type `-p rust-poc` every time.
+# Lost once in commit 6add5f1 — restored here.
+default-run = "rust-poc"
 description = "Personal Rust learning workspace — workspace + traits + tests Hello World"
 license = "MIT"
 publish = false
