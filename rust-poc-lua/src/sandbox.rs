@@ -5,6 +5,12 @@
 use mlua::{Lua, Nil, Result as LuaResult};
 
 pub(super) fn harden(lua: &Lua) -> LuaResult<()> {
+    // Capture a monotonic start time now so `os.clock()` can report elapsed
+    // seconds since the VM was hardened — matching the intent of the Lua
+    // standard library's `os.clock()` (CPU/wall time since process start).
+    // If we wrote `Instant::now().elapsed()` *inside* the closure instead,
+    // every call would measure the time from a freshly created instant (≈ 0).
+    let start = std::time::Instant::now();
     let g = lua.globals();
 
     // Remove dangerous or FS-escape-prone APIs entirely.
@@ -42,7 +48,7 @@ pub(super) fn harden(lua: &Lua) -> LuaResult<()> {
     )?;
     os_table.set(
         "clock",
-        lua.create_function(|_, ()| Ok(std::time::Instant::now().elapsed().as_secs_f64()))?,
+        lua.create_function(move |_, ()| Ok(start.elapsed().as_secs_f64()))?,
     )?;
     g.set("os", os_table)?;
 

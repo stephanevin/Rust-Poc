@@ -33,7 +33,10 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_NetManagement",       # NetApiBufferFree
+    "Win32_Networking_ActiveDirectory",           # DsGetSiteNameW
     "Win32_Networking_WinSock",
+    "Win32_Security_Authentication_Identity",     # GetComputerObjectNameW + EXTENDED_NAME_FORMAT
     "Wdk",
     "Wdk_System",
     "Wdk_System_SystemServices",

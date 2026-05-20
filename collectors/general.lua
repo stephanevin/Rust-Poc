@@ -84,6 +84,15 @@ function collect()
     machine_name             = host.netbios_name(),
     host_name                = host.host_name(),
     fqdn                     = host.fqdn(),
+
+    -- Active Directory — computer object (nil on non-domain-joined machines).
+    -- Tier-1: GetComputerObjectNameW / DsGetSiteNameW (Netlogon local cache).
+    -- Tier-2 (dn + site only): GP State Machine registry — survives offline.
+    ad_computer_sam          = host.ad_computer_sam(),
+    ad_computer_dn           = host.ad_computer_dn(),
+    ad_computer_cn           = host.ad_computer_cn(),
+    ad_computer_site         = host.ad_computer_site(),
+
     user_name                = host.env("USERNAME"),
     logon_domain             = host.env("USERDOMAIN"),
     mail_address             = host.adsi_user_mail(15),

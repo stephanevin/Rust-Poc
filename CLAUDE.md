@@ -218,17 +218,18 @@ rust-poc-lua/src/
 ├── lib.rs          # Public API + non-Windows stub
 ├── runtime.rs      # InternalRuntime::run — async, tokio::spawn_blocking + timeout
 ├── sandbox.rs      # Strips io/dofile/require/etc. globals
-├── host.rs         # 18 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── host.rs         # 22 `host.*` bindings + HostState (Rc<RefCell<..>>)
 ├── wmi.rs          # COMLibrary + WMIConnection + per-class cache
 ├── registry.rs     # RegOpenKeyExW + RegQueryValueExW + REG_* decode
 ├── net.rs          # GetAdaptersAddresses + IPv4 enumeration
 ├── hostname.rs     # GetComputerNameExW — 3 variants (deviation #6, not in upstream)
+├── adcomputer.rs   # GetComputerObjectNameW + DsGetSiteNameW — 4 AD attrs (deviation #7, not in upstream)
 ├── winver.rs       # RtlGetVersion + GetFirmwareType
 ├── eventlog.rs     # Install date (registry-derived ISO 8601)
 └── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 20 `host.*` bindings exposed to Lua
+### The 24 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -244,6 +245,10 @@ rust-poc-lua/src/
 | `host.host_name()` **(deviation #6)** | `GetComputerNameExW(ComputerNameDnsHostname)` | `string?` |
 | `host.fqdn()` **(deviation #6)** | `GetComputerNameExW(ComputerNameDnsFullyQualified)` | `string?` |
 | `host.adsi_user_mail(timeout_s)` | ADSI stub (returns nil unless USERDNSDOMAIN is set) | `string?` |
+| `host.ad_computer_sam()` **(deviation #7)** | `GetComputerObjectNameW(NameSamCompatible)` | `string?` |
+| `host.ad_computer_dn()` **(deviation #7)** | `GetComputerObjectNameW(NameFullyQualifiedDN)` + GP registry fallback | `string?` |
+| `host.ad_computer_cn()` **(deviation #7)** | `GetComputerObjectNameW(NameCanonical)` | `string?` |
+| `host.ad_computer_site()` **(deviation #7)** | `DsGetSiteNameW` + GP registry fallback | `string?` |
 | `host.setup_history()` | `eventlog::install_info` | `{install_date, history[]}` |
 | `host.cpu_details()` | WMI `Win32_Processor.Name + SocketDesignation` | `string?` |
 | `host.ram_total()` | WMI `Win32_PhysicalMemory.Capacity` (summed) | `number?` |
@@ -288,7 +293,7 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **six** points where copying upstream byte-for-byte
+There are exactly **seven** points where copying upstream byte-for-byte
 would not compile or would not match the surface this PoC needs to
 expose. Each one is documented inline at the touch site so a future
 re-sync is mechanical.
@@ -327,7 +332,7 @@ re-sync is mechanical.
 
 6. **`rust-poc-lua/src/hostname.rs` + `install_hostname_bindings` in
    `host.rs` — three additional hostname bindings.**
-   Upstream exposes 17 `host.*` bindings; this PoC exposes 20. The
+   Upstream exposes 17 `host.*` bindings; this PoC exposes 24. The
    three extra bindings all call `GetComputerNameExW` with a different
    `COMPUTER_NAME_FORMAT` constant (non-`Physical*` variants — parité
    avec `IPGlobalProperties.HostName` de .NET, voir ci-dessous) :
@@ -351,6 +356,34 @@ re-sync is mechanical.
    align names + signatures and drop this deviation. Until then, every
    upstream `Copy-Item` MUST preserve `hostname.rs` and the
    `install_hostname_bindings` call in `host.rs`.
+
+7. **`rust-poc-lua/src/adcomputer.rs` + `install_ad_computer_bindings`
+   in `host.rs` — four AD computer-object bindings.**
+   Mirrors `ActiveDirectory.cs` from the ComplianceApp; not in
+   upstream. Exposes AD attributes of the local computer account via
+   `GetComputerObjectNameW` (`Win32_Security_Authentication_Identity`)
+   and `DsGetSiteNameW` (`Win32_Networking_ActiveDirectory`):
+   - `host.ad_computer_sam()` — `NameSamCompatible`
+     (e.g. `PHARMA\E00AVDDWDEV0271$`).
+   - `host.ad_computer_dn()` — `NameFullyQualifiedDN`
+     (e.g. `CN=E00AVDDWDEV0271,OU=WAAS,...,DC=com`).
+     Falls back to `HKLM\...\Group Policy\State\Machine\Distinguished-Name`
+     when Netlogon is not cached.
+   - `host.ad_computer_cn()` — `NameCanonical`
+     (e.g. `pharma.aventis.com/ZZ NGDC EMEA/.../E00AVDDWDEV0271`).
+   - `host.ad_computer_site()` — `DsGetSiteNameW`
+     (e.g. `IE-AZU02`).
+     Falls back to `HKLM\...\Group Policy\State\Machine\Site-Name`
+     when `DsGetSiteNameW` fails.
+   All four return `nil` on workgroup machines or before the first GP
+   cycle, and record the failure in `host.errors()`. The LDAP
+   (`DirectorySearcher`) level present in the C# reference is
+   intentionally absent — it requires an active network connection,
+   inconsistent with offline-first resilience.
+   Re-sync impact: add `adcomputer.rs` to the upstream crate and drop
+   this deviation if the fleet-client eventually needs these fields.
+   Until then, `Copy-Item` MUST preserve `adcomputer.rs` and the
+   `install_ad_computer_bindings` call in `host.rs`.
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is

@@ -57,8 +57,17 @@ impl InternalRuntime {
             .await
             .map_err(|e| LuaError(format!("read {path}: {e}", path = full_path.display())))?;
 
-        // mlua::Lua is !Send, so run on a blocking thread. Wrap the join
-        // handle in `timeout` so we enforce the wall-clock bound.
+        // mlua::Lua is !Send, so run on a blocking thread.
+        //
+        // IMPORTANT — timeout semantics: `tokio::time::timeout` wraps the
+        // *await on the JoinHandle*, not the blocking task itself. Dropping
+        // the JoinHandle on timeout does NOT cancel the task (documented
+        // Tokio behaviour). If a script loops forever, the blocking thread
+        // keeps running even after the caller receives `LuaError("timeout")`.
+        // Truly cancelling a !Send Lua VM requires a process boundary
+        // (separate worker process + TerminateProcess) or a cooperative
+        // interrupt hook — out of scope for this PoC. The timeout here is
+        // "abandon waiting for the result", not "stop the script".
         let join = tokio::task::spawn_blocking(move || -> Result<Value, String> {
             let lua = Lua::new();
             sandbox::harden(&lua).map_err(|e| format!("sandbox: {e}"))?;

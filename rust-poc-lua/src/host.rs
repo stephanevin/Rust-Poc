@@ -90,6 +90,7 @@ pub(super) fn install(
     install_net_bindings(lua, &host, &state)?;
     install_hostname_bindings(lua, &host, &state)?;
     install_ad_bindings(lua, &host, &state)?;
+    install_ad_computer_bindings(lua, &host, &state)?;
     install_setup_history(lua, &host)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
@@ -256,12 +257,17 @@ fn install_net_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<(
 // whichever granularity they need. See `super::hostname` for the Win32
 // backing constants, invariants, and the non-Physical rationale.
 
-/// Registers one hostname binding.
+/// Registers a binding that calls a fallible string getter.
+///
+/// On success the Lua function returns the string; on failure it returns
+/// `nil` and records the error in `host.errors()`.
 ///
 /// `name` must be `'static` so it can be captured into the `'static`
 /// closure that `lua.create_function` requires. `f` is a bare function
 /// pointer (`fn`, not `Fn`) — sufficient because each getter is a named
 /// free function, not a closure that captures state.
+///
+/// Reused by [`install_hostname_bindings`] and [`install_ad_computer_bindings`].
 fn bind_hostname(
     lua: &Lua,
     host: &Table,
@@ -289,6 +295,14 @@ fn install_hostname_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
     bind_hostname(lua, host, state, "netbios_name", super::hostname::netbios_name)?;
     bind_hostname(lua, host, state, "host_name",    super::hostname::dns_hostname)?;
     bind_hostname(lua, host, state, "fqdn",         super::hostname::dns_fqdn)?;
+    Ok(())
+}
+
+fn install_ad_computer_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    bind_hostname(lua, host, state, "ad_computer_sam",  super::adcomputer::sam_name)?;
+    bind_hostname(lua, host, state, "ad_computer_dn",   super::adcomputer::distinguished_name)?;
+    bind_hostname(lua, host, state, "ad_computer_cn",   super::adcomputer::canonical_name)?;
+    bind_hostname(lua, host, state, "ad_computer_site", super::adcomputer::site_name)?;
     Ok(())
 }
 

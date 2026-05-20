@@ -1,4 +1,4 @@
-//! In-process Lua 5.4 collector runtime + 20 `host.*` bindings.
+//! In-process Lua 5.4 collector runtime + 24 `host.*` bindings.
 //!
 //! This crate is **Windows-only** (real impl). On every other target
 //! (Linux dev/CI, macOS until macOS host bindings exist) it compiles to
@@ -7,14 +7,17 @@
 //!
 //! ## Wire contract
 //!
-//! 17 of the 20 `host.*` bindings are a verbatim port of `HOST_API` in
+//! 17 of the 24 `host.*` bindings are a verbatim port of `HOST_API` in
 //! the upstream `sdh-fleet-client/contracts` crate; the runtime here
 //! MUST stay in lockstep with those — every change to `HOST_API` requires
 //! a matching change in `host.rs` and a regenerated `host-api.json` (the
 //! portal's Monaco editor depends on the JSON; the CI drift gate enforces
-//! it). The remaining three (`host.netbios_name()`, `host.host_name()`,
-//! and `host.fqdn()` in [`hostname`]) are deliberate additions on top of
-//! the upstream surface; see `CLAUDE.md` § *Deviations* #6.
+//! it). The remaining seven are deliberate additions: three hostname
+//! variants (`host.netbios_name()`, `host.host_name()`, `host.fqdn()` in
+//! [`hostname`], deviation #6) and four AD computer-object attributes
+//! (`host.ad_computer_sam()`, `host.ad_computer_dn()`,
+//! `host.ad_computer_cn()`, `host.ad_computer_site()` in [`adcomputer`],
+//! deviation #7). See `CLAUDE.md` § *Deviations* for rationale.
 
 /// Failures from the Lua collector runtime.
 ///
@@ -36,6 +39,10 @@ mod host;
 // `host.fqdn()` (machine-name variants via GetComputerNameExW).
 #[cfg(windows)]
 mod hostname;
+// `adcomputer` is the deviation #7 module — AD computer-object attributes
+// via GetComputerObjectNameW and DsGetSiteNameW, with GP registry fallback.
+#[cfg(windows)]
+mod adcomputer;
 #[cfg(windows)]
 mod net;
 #[cfg(windows)]
