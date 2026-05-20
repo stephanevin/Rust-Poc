@@ -106,6 +106,18 @@ impl Greeting {
 
     /// Returns the preferred display name — nickname when set, real
     /// name otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rust_poc_contracts::{Greeting, Language};
+    ///
+    /// let g = Greeting::new("Alice", Language::English);
+    /// assert_eq!(g.display_name(), "Alice");
+    ///
+    /// let g = Greeting::with_nickname("Robert", Language::French, "Bob");
+    /// assert_eq!(g.display_name(), "Bob");
+    /// ```
     #[must_use]
     pub fn display_name(&self) -> &str {
         self.nickname.as_deref().unwrap_or(&self.name)

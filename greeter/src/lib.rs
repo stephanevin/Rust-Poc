@@ -9,6 +9,19 @@ use rust_poc_contracts::Greeting;
 /// Anything that knows how to turn a `Greeting` into a user-facing
 /// string. Zero-state by design — implementations are unit structs so
 /// the binary can hold them without lifetime constraints.
+///
+/// # Examples
+///
+/// ```
+/// use rust_poc_contracts::{Greeting, Language};
+/// use rust_poc_greeter::{EnglishGreeter, FrenchGreeter, Greeter};
+///
+/// let g = Greeting::new("World", Language::English);
+/// assert_eq!(EnglishGreeter.greet(&g), "Hello, World!");
+///
+/// let g = Greeting::new("Monde", Language::French);
+/// assert_eq!(FrenchGreeter.greet(&g), "Bonjour, Monde !");
+/// ```
 pub trait Greeter {
     fn greet(&self, greeting: &Greeting) -> String;
 }

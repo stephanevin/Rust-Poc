@@ -69,7 +69,6 @@ Bonjour, Monde !
 Les prochaines etapes naturelles pour enrichir ce POC sans casser le pattern :
 
 - Ajouter une 3e crate `greeter-async` qui implemente `Greeter` via `tokio::time::sleep` pour decouvrir l'async-await
-- Faire que `Greeting` derive `serde::{Serialize, Deserialize}` pour decouvrir la serialisation JSON
 - Ajouter une crate `cli` avec `clap` pour parser des arguments en ligne de commande
 - Introduire un module de gestion d'erreur avec `thiserror` et `Result<T, E>`
 - Ajouter un test d'integration sous `tests/` au niveau workspace
