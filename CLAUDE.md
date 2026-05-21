@@ -218,18 +218,18 @@ rust-poc-lua/src/
 ├── lib.rs          # Public API + non-Windows stub
 ├── runtime.rs      # InternalRuntime::run — async, tokio::spawn_blocking + timeout
 ├── sandbox.rs      # Strips io/dofile/require/etc. globals
-├── host.rs         # 22 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── host.rs         # 23 `host.*` bindings + HostState (Rc<RefCell<..>>)
 ├── wmi.rs          # COMLibrary + WMIConnection + per-class cache
 ├── registry.rs     # RegOpenKeyExW + RegQueryValueExW + REG_* decode
 ├── net.rs          # GetAdaptersAddresses + IPv4 enumeration
 ├── hostname.rs     # GetComputerNameExW — 3 variants (deviation #6, not in upstream)
-├── adcomputer.rs   # GetComputerObjectNameW + DsGetSiteNameW — 4 AD attrs (deviation #7, not in upstream)
+├── adcomputer.rs   # GetComputerObjectNameW + DsGetSiteNameW + GetUserNameExW — 5 AD attrs (deviation #7, not in upstream)
 ├── winver.rs       # RtlGetVersion + GetFirmwareType
 ├── eventlog.rs     # Install date (registry-derived ISO 8601)
 └── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 24 `host.*` bindings exposed to Lua
+### The 27 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -249,6 +249,7 @@ rust-poc-lua/src/
 | `host.ad_computer_dn()` **(deviation #7)** | `GetComputerObjectNameW(NameFullyQualifiedDN)` + GP registry fallback | `string?` |
 | `host.ad_computer_cn()` **(deviation #7)** | `GetComputerObjectNameW(NameCanonical)` | `string?` |
 | `host.ad_computer_site()` **(deviation #7)** | `DsGetSiteNameW` + GP registry fallback | `string?` |
+| `host.mail_address()` **(deviation #7)** | `GetUserNameExW(NameUserPrincipal)` — UPN, offline proxy for `mail` LDAP attr | `string?` |
 | `host.setup_history()` | `eventlog::install_info` | `{install_date, history[]}` |
 | `host.cpu_details()` | WMI `Win32_Processor.Name + SocketDesignation` | `string?` |
 | `host.ram_total()` | WMI `Win32_PhysicalMemory.Capacity` (summed) | `number?` |
@@ -256,6 +257,8 @@ rust-poc-lua/src/
 | `host.motherboard_details()` | WMI `Win32_ComputerSystem.Model + SystemFamily` | `string?` |
 | `host.bios_details()` | WMI `Win32_BIOS.BIOSVersion` + `winver::firmware_type` | `string?` |
 | `host.desktop_resolution()` | WMI `Win32_VideoController.{Current*Resolution, RefreshRate}` | `string?` |
+| `host.chassis_type()` **(deviation #8)** | WMI `Win32_SystemEnclosure.ChassisTypes[0]` → SMBIOS code + label | `{code: number, label: string}?` |
+| `host.virtual_machine()` **(deviation #8)** | CPUID leaf 1 ECX bit 31 (`std::arch::x86_64::__cpuid`) | `bool` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -293,7 +296,7 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **seven** points where copying upstream byte-for-byte
+There are exactly **eight** points where copying upstream byte-for-byte
 would not compile or would not match the surface this PoC needs to
 expose. Each one is documented inline at the touch site so a future
 re-sync is mechanical.
@@ -384,6 +387,23 @@ re-sync is mechanical.
    this deviation if the fleet-client eventually needs these fields.
    Until then, `Copy-Item` MUST preserve `adcomputer.rs` and the
    `install_ad_computer_bindings` call in `host.rs`.
+
+8. **`rust-poc-lua/src/host.rs` — two hardware enrichment bindings.**
+   Not in upstream. Added as composite bindings inside
+   `install_composites()`:
+   - `host.chassis_type()` — reads `Win32_SystemEnclosure.ChassisTypes[0]`
+     (SMBIOS Type-3 code) and translates it to a human-readable label
+     via the `chassis_type_str()` match table (codes 1–36, SMBIOS 3.x
+     spec §7.4). Returns `nil` on WMI failure.
+   - `host.virtual_machine()` — issues a single CPUID instruction
+     (`std::arch::x86_64::__cpuid(1)`) and tests ECX bit 31 (the
+     hypervisor-present bit, mandatory by the x86 hypervisor discovery
+     protocol). Returns `true` on Hyper-V, VMware, VirtualBox, KVM;
+     `false` on bare metal or any non-x86_64 target. Requires no COM
+     initialisation and works when WMI is unavailable.
+   Re-sync impact: `Copy-Item` of `host.rs` MUST preserve
+   `bind_chassis_type`, `bind_virtual_machine`, `chassis_type_str`, and
+   their calls inside `install_composites`.
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is

@@ -303,6 +303,10 @@ fn install_ad_computer_bindings(lua: &Lua, host: &Table, state: &HostRef) -> Lua
     bind_hostname(lua, host, state, "ad_computer_dn",   super::adcomputer::distinguished_name)?;
     bind_hostname(lua, host, state, "ad_computer_cn",   super::adcomputer::canonical_name)?;
     bind_hostname(lua, host, state, "ad_computer_site", super::adcomputer::site_name)?;
+    // UPN of the current user — exposed as `mail_address` because the UPN
+    // (user@domain.com) is the best offline proxy for the Exchange `mail`
+    // LDAP attribute. See adcomputer::user_upn() doc for the UPN ≠ mail caveat.
+    bind_hostname(lua, host, state, "mail_address",     super::adcomputer::user_upn)?;
     Ok(())
 }
 
@@ -349,6 +353,8 @@ fn install_composites(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()>
     bind_motherboard_details(lua, host, state)?;
     bind_bios_details(lua, host, state)?;
     bind_desktop_resolution(lua, host, state)?;
+    bind_chassis_type(lua, host, state)?;
+    bind_virtual_machine(lua, host, state)?;
     Ok(())
 }
 
@@ -555,6 +561,175 @@ fn bind_desktop_resolution(lua: &Lua, host: &Table, state: &HostRef) -> LuaResul
             }
         })?,
     )
+}
+
+/// Translates a raw SMBIOS System Enclosure Type code (SMBIOS spec 3.x, §7.4)
+/// into a human-readable label.  Codes 1–36 are defined; anything outside
+/// that range falls through to `"Unknown"`.
+fn chassis_type_str(code: u32) -> &'static str {
+    match code {
+        1 => "Other",
+        3 => "Desktop",
+        4 => "Low Profile Desktop",
+        5 => "Pizza Box",
+        6 => "Mini Tower",
+        7 => "Tower",
+        8 => "Portable",
+        9 => "Laptop",
+        10 => "Notebook",
+        11 => "Handheld",
+        12 => "Docking Station",
+        13 => "All-in-One",
+        14 => "Sub-Notebook",
+        15 => "Space-Saving",
+        16 => "Lunch Box",
+        17 => "Main Server Chassis",
+        18 => "Expansion Chassis",
+        19 => "Sub-Chassis",
+        20 => "Bus Expansion Chassis",
+        21 => "Peripheral Chassis",
+        22 => "RAID Chassis",
+        23 => "Rack Mount Chassis",
+        24 => "Sealed-Case PC",
+        25 => "Multi-System Chassis",
+        26 => "Compact PCI",
+        27 => "AdvancedTCA",
+        28 => "Blade",
+        29 => "Blade Enclosure",
+        30 => "Tablet",
+        31 => "Convertible",
+        32 => "Detachable",
+        33 => "IoT Gateway",
+        34 => "Embedded PC",
+        35 => "Mini PC",
+        36 => "Stick PC",
+        _ => "Unknown",
+    }
+}
+
+/// Exposes `host.chassis_type()` → `{code: number, label: string} | nil`.
+///
+/// Reads `Win32_SystemEnclosure.ChassisTypes[0]` (SMBIOS Type-3 field) and
+/// returns a two-field table:
+/// - `code`  — raw SMBIOS type code (e.g. `9`)
+/// - `label` — human-readable label (e.g. `"Laptop"`)
+///
+/// Returning both lets Lua scripts display the label while still being able
+/// to branch on the numeric code (e.g. group codes 8/9/10/14 as "portable").
+/// Returns `nil` when WMI fails or `ChassisTypes` is absent (error recorded
+/// in `host.errors()` on WMI failure; silent `nil` when the property is
+/// simply not present — consistent with other composite bindings).
+fn bind_chassis_type(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        "chassis_type",
+        lua.create_function(move |lua, ()| {
+            let mut st = s.borrow_mut();
+            let res = st.wmi().and_then(|wmi| {
+                let v = wmi.query_first("Win32_SystemEnclosure", "ChassisTypes")?;
+                // ChassisTypes is an array of uint16; take the first element.
+                // SMBIOS codes are in 1–36, so the u64→u32 cast is lossless;
+                // we use try_from rather than `as` to satisfy pedantic clippy.
+                // Returns Ok(None) — not an invented "Unknown" — when the
+                // property is absent so the Lua binding returns nil instead of
+                // a fabricated value.
+                let code = v
+                    .as_ref()
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok());
+                Ok(code.map(|c| (c, chassis_type_str(c))))
+            });
+            match res {
+                Ok(Some((code, label))) => {
+                    let t = lua.create_table()?;
+                    t.set("code", code)?;
+                    t.set("label", label)?;
+                    Ok(Some(t))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => {
+                    st.record_error("chassis_type", e);
+                    Ok(None)
+                }
+            }
+        })?,
+    )
+}
+
+/// Exposes `host.virtual_machine()` → `bool`.
+///
+/// Detection uses two layers:
+///
+/// **Primary — WMI `Win32_ComputerSystem.Model`.**
+/// Hyper-V VMs expose `"Virtual Machine"`, `VMware` exposes a model containing
+/// `"VMware"`, `VirtualBox` `"VirtualBox"`, QEMU/KVM `"QEMU"`.  This correctly
+/// returns `false` for physical Windows 11 machines that have Hyper-V active
+/// for VBS/Credential Guard — they carry a real hardware model string.
+///
+/// **Fallback — CPUID leaf 1 ECX bit 31 + vendor string.**
+/// When WMI is unavailable, the hypervisor-present bit is tested.  If set,
+/// the vendor leaf (`0x40000000`) is read: any vendor other than
+/// `"Microsoft Hv"` is a non-Microsoft hypervisor and guarantees a VM.
+/// `"Microsoft Hv"` is deliberately ignored in the fallback because Windows
+/// with VBS reports it even on physical hardware — the WMI model check is
+/// the authoritative discriminator for that case.
+///
+/// On non-x86_64 targets the function always returns `false`.
+fn bind_virtual_machine(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        "virtual_machine",
+        lua.create_function(move |_, ()| {
+            let mut st = s.borrow_mut();
+            Ok(detect_virtual_machine(&mut st))
+        })?,
+    )
+}
+
+fn detect_virtual_machine(st: &mut HostState) -> bool {
+    // --- Layer 1: WMI model string ----------------------------------------
+    // Win32_ComputerSystem.Model is already cached if motherboard_details ran.
+    let model = st
+        .wmi()
+        .ok()
+        .and_then(|wmi| wmi.query_first("Win32_ComputerSystem", "Model").ok())
+        .flatten()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+
+    if model == "Virtual Machine"       // Hyper-V guest
+        || model.contains("VMware")     // VMware Workstation / ESXi
+        || model.contains("VirtualBox") // Oracle VirtualBox
+        || model.contains("QEMU")       // KVM / QEMU
+    {
+        return true;
+    }
+
+    // --- Layer 2: CPUID (offline fallback) ---------------------------------
+    // Bit 31 of CPUID(1).ECX = hypervisor-present bit.
+    // Vendor string from CPUID(0x40000000): non-"Microsoft Hv" vendors are
+    // unambiguously VMs.  "Microsoft Hv" is skipped here because VBS on
+    // physical hardware also reports it — Layer 1 is the tie-breaker for
+    // that case.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // CPUID is always available on x86_64 — the ISA mandates it.
+        let leaf1 = std::arch::x86_64::__cpuid(1);
+        if (leaf1.ecx >> 31) & 1 == 1 {
+            let vendor_leaf = std::arch::x86_64::__cpuid(0x4000_0000);
+            let mut bytes = [0u8; 12];
+            bytes[0..4].copy_from_slice(&vendor_leaf.ebx.to_le_bytes());
+            bytes[4..8].copy_from_slice(&vendor_leaf.ecx.to_le_bytes());
+            bytes[8..12].copy_from_slice(&vendor_leaf.edx.to_le_bytes());
+            if std::str::from_utf8(&bytes).is_ok_and(|s| s != "Microsoft Hv") {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 // --- errors() ---------------------------------------------------------

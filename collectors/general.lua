@@ -95,7 +95,9 @@ function collect()
 
     user_name                = host.env("USERNAME"),
     logon_domain             = host.env("USERDOMAIN"),
-    mail_address             = host.adsi_user_mail(15),
+    -- UPN from GetUserNameExW(NameUserPrincipal) — offline-friendly proxy
+    -- for the Exchange mail attribute. See adcomputer::user_upn() for caveat.
+    mail_address             = host.mail_address(),
     ip_addresses             = flatten_ips(host.net_interfaces()),
     desktop_resolution       = host.desktop_resolution(),
     ca_definitions           = "Win10-Laptop",
@@ -111,6 +113,12 @@ function collect()
     motherboard_details      = host.motherboard_details(),
     bios_details             = host.bios_details(),
     serial_number            = host.wmi_query("Win32_BIOS", "SerialNumber"),
+    -- SMBIOS System Enclosure Type 3 → { code: number, label: string }.
+    -- e.g. { code = 9, label = "Laptop" } or { code = 3, label = "Desktop" }.
+    -- Use chassis_type.label for display, chassis_type.code for branching logic.
+    chassis_type             = host.chassis_type(),
+    -- CPUID leaf 1 ECX bit 31: true on any hypervisor (Hyper-V, VMware, VirtualBox, KVM).
+    virtual_machine          = host.virtual_machine(),
 
     -- Operating System
     os_product                = os_product_name(ver),

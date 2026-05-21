@@ -1,4 +1,4 @@
-//! In-process Lua 5.4 collector runtime + 24 `host.*` bindings.
+//! In-process Lua 5.4 collector runtime + 25 `host.*` bindings.
 //!
 //! This crate is **Windows-only** (real impl). On every other target
 //! (Linux dev/CI, macOS until macOS host bindings exist) it compiles to
@@ -7,7 +7,7 @@
 //!
 //! ## Wire contract
 //!
-//! 17 of the 24 `host.*` bindings are a verbatim port of `HOST_API` in
+//! 17 of the 25 `host.*` bindings are a verbatim port of `HOST_API` in
 //! the upstream `sdh-fleet-client/contracts` crate; the runtime here
 //! MUST stay in lockstep with those — every change to `HOST_API` requires
 //! a matching change in `host.rs` and a regenerated `host-api.json` (the

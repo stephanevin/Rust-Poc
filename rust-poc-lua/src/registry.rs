@@ -10,9 +10,9 @@ use std::os::windows::ffi::OsStringExt;
 
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_MULTI_SZ,
-    REG_QWORD, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+    REG_QWORD, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
 };
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 use serde_json::Value;
 
@@ -70,6 +70,61 @@ pub(super) fn read(hive: &str, key: &str, value: &str) -> Result<Option<Value>, 
     };
 
     Ok(result_val)
+}
+
+/// Returns the names of all direct subkeys of `key` in `hive`.
+/// Returns an empty `Vec` when the key is absent or has no subkeys.
+pub(super) fn subkey_names(hive: &str, key: &str) -> Vec<String> {
+    let root: HKEY = match hive {
+        "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
+        "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
+        _ => return Vec::new(),
+    };
+
+    let mut hkey = HKEY::default();
+    let key_w: HSTRING = key.into();
+    // SAFETY: HSTRING lives for the call; KEY_READ is a non-destructive flag.
+    let opened = unsafe {
+        RegOpenKeyExW(root, PCWSTR(key_w.as_ptr()), None, KEY_READ, &mut hkey).is_ok()
+    };
+    if !opened {
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    // Registry key names are at most 255 characters (+ NUL).  256 fits in u32.
+    let mut name_buf = vec![0u16; 256];
+    let buf_capacity: u32 = 256;
+    for idx in 0_u32.. {
+        let mut name_len = buf_capacity;
+        // SAFETY: hkey is valid; name_buf outlives the call; we pass its
+        // length so the API cannot write past the end.
+        let r = unsafe {
+            RegEnumKeyExW(
+                hkey,
+                idx,
+                Some(PWSTR(name_buf.as_mut_ptr())),
+                &mut name_len,
+                None,
+                Some(PWSTR::null()),
+                None,
+                None,
+            )
+        };
+        if !r.is_ok() {
+            // Covers ERROR_NO_MORE_ITEMS (259) and any unexpected error.
+            break;
+        }
+        let name = OsString::from_wide(&name_buf[..name_len as usize])
+            .to_string_lossy()
+            .into_owned();
+        names.push(name);
+    }
+
+    // SAFETY: hkey was opened successfully; RegCloseKey never fails for a
+    // handle returned by RegOpenKeyExW.
+    unsafe { let _ = RegCloseKey(hkey); }
+    names
 }
 
 fn decode(t: REG_VALUE_TYPE, buf: &[u8]) -> Option<Value> {

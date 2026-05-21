@@ -9,6 +9,7 @@
 //! | [`distinguished_name`] | `GetComputerObjectNameW(NameFullyQualifiedDN)`       | `CN=E00AVDDWDEV0271,OU=WAAS,...,DC=com`            |
 //! | [`canonical_name`]   | `GetComputerObjectNameW(NameCanonical)`                | `pharma.aventis.com/ZZ NGDC EMEA/.../...`          |
 //! | [`site_name`]        | `DsGetSiteNameW`                                       | `IE-AZU02`                                         |
+//! | [`user_upn`]         | `GetUserNameExW(NameUserPrincipal)`                    | `firstname.lastname@sanofi.com`                    |
 //!
 //! ## Fault tolerance (two-tier, mirrors `ActiveDirectory.cs` in `ComplianceApp`)
 //!
@@ -45,8 +46,8 @@ use windows::Win32::Foundation::WIN32_ERROR;
 use windows::Win32::NetworkManagement::NetManagement::NetApiBufferFree;
 use windows::Win32::Networking::ActiveDirectory::DsGetSiteNameW;
 use windows::Win32::Security::Authentication::Identity::{
-    EXTENDED_NAME_FORMAT, GetComputerObjectNameW, NameCanonical, NameFullyQualifiedDN,
-    NameSamCompatible,
+    EXTENDED_NAME_FORMAT, GetComputerObjectNameW, GetUserNameExW, NameCanonical,
+    NameFullyQualifiedDN, NameSamCompatible, NameUserPrincipal,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -211,6 +212,77 @@ fn ds_get_site_name() -> Result<String, String> {
     result
 }
 
+// --- Current user identity -------------------------------------------
+//
+// `GetUserNameExW` lives in the same DLL (`secur32.dll`) and accepts the
+// same `EXTENDED_NAME_FORMAT` enum as `GetComputerObjectNameW`. It queries
+// the *current user*'s name in the requested format from the Netlogon
+// local cache — no network call required once the user is authenticated.
+
+/// Two-call sizing pattern for `GetUserNameExW`, parameterised by `format`.
+///
+/// Identical flow to [`get_object_name`]; separated because the function
+/// being called and the entity queried (user vs. computer) differ.
+fn get_user_name(format: EXTENDED_NAME_FORMAT) -> Result<String, String> {
+    let mut size: u32 = 0;
+
+    // SAFETY: sizing probe — same rationale as in get_object_name.
+    unsafe {
+        let _ = GetUserNameExW(format, None, &raw mut size);
+    }
+
+    if size == 0 {
+        return Err(format!(
+            "GetUserNameExW({format:?}): sizing probe returned size=0 \
+             (user may not be domain-authenticated)"
+        ));
+    }
+
+    let mut buf = vec![0u16; size as usize];
+
+    // SAFETY: `buf` holds exactly `size` WCHARs as reported by the sizing
+    // probe. On success `size` is overwritten — truncate before decoding.
+    let ok = unsafe { GetUserNameExW(format, Some(PWSTR(buf.as_mut_ptr())), &raw mut size) };
+    if !ok {
+        // SAFETY: called immediately after the failed Win32 function on the
+        // same thread.
+        return Err(format!(
+            "GetUserNameExW({format:?}): {}",
+            windows::core::Error::from_thread()
+        ));
+    }
+
+    buf.truncate(size as usize);
+    // Apply the same defensive NUL strip as get_object_name.
+    while buf.last() == Some(&0u16) {
+        buf.pop();
+    }
+    OsString::from_wide(&buf)
+        .into_string()
+        .map_err(|_| format!("GetUserNameExW({format:?}): result is not valid UTF-8"))
+}
+
+/// Returns the User Principal Name (UPN) of the currently logged-in user.
+///
+/// Format: `user@domain.com` (e.g. `firstname.lastname@sanofi.com`).
+/// Backed by `GetUserNameExW(NameUserPrincipal)` via Netlogon's local cache
+/// — no network call is required once the user has authenticated to a DC.
+///
+/// ## Relation to `mail_address`
+///
+/// This value is exposed as `mail_address` in the collector output. In
+/// enterprise Active Directory environments the UPN is almost always
+/// identical to the Exchange `mail` attribute. They can differ in edge
+/// cases (secondary SMTP addresses, shared mailboxes, migration scenarios).
+/// The true LDAP `mail` attribute requires an ADSI/COM call (`IADsUser::get("mail")`)
+/// — phase 2 of `ad.rs`. Until then, the UPN is the best offline proxy.
+///
+/// Returns `Err` (→ `nil` in Lua) on workgroup machines or when the user
+/// is not domain-authenticated.
+pub(super) fn user_upn() -> Result<String, String> {
+    get_user_name(NameUserPrincipal)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -262,5 +334,17 @@ mod tests {
             assert!(!s.is_empty(), "site name must not be empty");
         }
         // Err(_) => workgroup or no site configured — linkage verified
+    }
+
+    #[test]
+    fn user_upn_smoke() {
+        if let Ok(s) = user_upn() {
+            assert!(!s.is_empty(), "UPN must not be empty");
+            assert!(
+                s.contains('@'),
+                "UPN must contain '@' separator: {s:?}"
+            );
+        }
+        // Err(_) => workgroup or user not domain-authenticated — linkage verified
     }
 }

@@ -1,34 +1,165 @@
 //! OS setup history + install date.
 //!
-//! Phase 1 derives `install_date` from the `InstallDate` DWORD under
-//! `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion` (Unix timestamp).
-//! The per-upgrade snapshot history from the Setup event log is deferred
-//! to phase 2 — that API requires `EvtQuery` + `EvtRender` + `XPath` parsing
-//! and the `PoC` doesn't need the timeline yet.
+//! Mirrors `WindowsSetupService` from ComplianceApp/ComplianceService/Services:
+//!
+//! 1. Read the **current** OS snapshot from
+//!    `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`.
+//! 2. Enumerate subkeys of `HKLM\SYSTEM\Setup` whose names start with
+//!    `"Source"` — Windows creates one per in-place upgrade, named
+//!    `"Source OS (Updated on …)"`.  Read the same field set from each.
+//! 3. Drop entries whose `InstallDate == 0` (invalid/absent).
+//! 4. Sort ascending by `InstallDate`.
+//! 5. Derive `install_date` via `GetInstallDate()` logic: walk from the
+//!    newest snapshot backward; return the install date of the first snapshot
+//!    whose *predecessor* has `MigrationScope != "5"`.  Falls back to the
+//!    oldest snapshot when all predecessors carry scope "5" or only one entry
+//!    exists.
 
 use serde_json::{Value, json};
 
 use super::registry;
 
+// ---------------------------------------------------------------------------
+// Internal snapshot type
+// ---------------------------------------------------------------------------
+
+struct Snapshot {
+    /// Raw Unix epoch seconds — used for sorting only.
+    timestamp: u64,
+    /// ISO 8601 UTC string for the JSON output.
+    install_date: String,
+    edition_id: String,
+    display_version: String,
+    major_version: String,
+    minor_version: String,
+    build_number: String,
+    /// UBR (Update Build Revision) serialised as a string to match the C# DTO.
+    release: String,
+    migration_scope: String,
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+/// Returns `{ install_date: string?, history: Snapshot[] }`.
+///
+/// `install_date` uses the `GetInstallDate()` heuristic (see module doc).
+/// `history` is sorted ascending so index 0 is the oldest upgrade step.
 pub(super) fn install_info() -> Value {
-    let install_date = registry::read(
-        "HKLM",
-        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
-        "InstallDate",
-    )
-    .ok()
-    .flatten()
-    .and_then(|v| v.as_u64())
-    .map(|ts| {
-        // Format as ISO 8601 UTC for the data science team.
-        let secs = i64::try_from(ts).unwrap_or(0);
-        format_unix_seconds(secs)
-    });
+    const CURRENT_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    const SETUP_KEY: &str = r"SYSTEM\Setup";
+
+    // Collect: current snapshot first (prepended), then source OS subkeys.
+    let main = read_snapshot(CURRENT_KEY);
+
+    let mut all: Vec<Snapshot> = registry::subkey_names("HKLM", SETUP_KEY)
+        .into_iter()
+        .filter(|name| {
+            // Case-insensitive prefix match to mirror C# OrdinalIgnoreCase.
+            name.get(..6)
+                .is_some_and(|p| p.eq_ignore_ascii_case("Source"))
+        })
+        .filter_map(|name| read_snapshot(&format!(r"{SETUP_KEY}\{name}")))
+        .collect();
+
+    if let Some(m) = main {
+        all.insert(0, m);
+    }
+
+    // Filter + sort — invalid entries (timestamp 0) were already filtered by
+    // read_snapshot, but keep the retain for explicitness.
+    all.retain(|s| s.timestamp != 0);
+    all.sort_by_key(|s| s.timestamp);
+
+    let install_date = derive_install_date(&all);
+
+    let history: Vec<Value> = all
+        .iter()
+        .map(|s| {
+            json!({
+                "install_date":    s.install_date,
+                "edition_id":      s.edition_id,
+                "display_version": s.display_version,
+                "major_version":   s.major_version,
+                "minor_version":   s.minor_version,
+                "build_number":    s.build_number,
+                "release":         s.release,
+                "migration_scope": s.migration_scope,
+            })
+        })
+        .collect();
 
     json!({
         "install_date": install_date,
-        "history": Value::Array(vec![]),
+        "history":      history,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// Reads one setup snapshot from `HKLM\<key>`.
+/// Returns `None` when `InstallDate` is absent or zero.
+fn read_snapshot(key: &str) -> Option<Snapshot> {
+    let timestamp = read_u64(key, "InstallDate");
+    if timestamp == 0 {
+        return None;
+    }
+    let secs = i64::try_from(timestamp).unwrap_or(0);
+
+    Some(Snapshot {
+        timestamp,
+        install_date: format_unix_seconds(secs),
+        edition_id: read_str(key, "EditionID"),
+        display_version: read_str(key, "DisplayVersion"),
+        major_version: read_u64(key, "CurrentMajorVersionNumber").to_string(),
+        minor_version: read_u64(key, "CurrentMinorVersionNumber").to_string(),
+        build_number: read_str(key, "CurrentBuild"),
+        release: read_u64(key, "UBR").to_string(),
+        migration_scope: read_str(key, "MigrationScope"),
+    })
+}
+
+/// `WindowsSetupService.GetInstallDate()` logic.
+///
+/// History is sorted ascending.  Walk backward from the newest entry.
+/// Stop at index `i` when `history[i-1].migration_scope != "5"` — that
+/// transition marks the boundary between an upgrade (scope 5) and a fresh
+/// install, so `history[i].install_date` is the answer.
+///
+/// Falls back to `history[0].install_date` when all predecessors carry
+/// scope "5", or there is only a single entry.
+fn derive_install_date(sorted_asc: &[Snapshot]) -> Option<String> {
+    if sorted_asc.is_empty() {
+        return None;
+    }
+    for i in (1..sorted_asc.len()).rev() {
+        if sorted_asc[i - 1].migration_scope != "5" {
+            return Some(sorted_asc[i].install_date.clone());
+        }
+    }
+    Some(sorted_asc[0].install_date.clone())
+}
+
+fn read_str(key: &str, name: &str) -> String {
+    registry::read("HKLM", key, name)
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn read_u64(key: &str, name: &str) -> u64 {
+    registry::read("HKLM", key, name)
+        .ok()
+        .flatten()
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0)
 }
 
 fn format_unix_seconds(secs: i64) -> String {
