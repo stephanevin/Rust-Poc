@@ -17,8 +17,8 @@
 
 use serde_json::{Value, json};
 use windows::Win32::System::RemoteDesktop::{
-    WTSEnumerateSessionsW, WTSFreeMemory, WTSQuerySessionInformationW,
-    WTS_CONNECTSTATE_CLASS, WTS_INFO_CLASS, WTS_SESSION_INFOW,
+    WTS_CONNECTSTATE_CLASS, WTS_INFO_CLASS, WTS_SESSION_INFOW, WTSEnumerateSessionsW,
+    WTSFreeMemory, WTSQuerySessionInformationW,
 };
 use windows::core::PWSTR;
 
@@ -58,9 +58,8 @@ fn query_session_string(session_id: u32, info_class: WTS_INFO_CLASS) -> Option<S
     let mut bytes: u32 = 0;
     // SAFETY: hServer = None → local machine. `buf` receives an opaque WTS
     // buffer that must be released with `WTSFreeMemory`.
-    let ok = unsafe {
-        WTSQuerySessionInformationW(None, session_id, info_class, &mut buf, &mut bytes)
-    };
+    let ok =
+        unsafe { WTSQuerySessionInformationW(None, session_id, info_class, &mut buf, &mut bytes) };
     // bytes <= 2: only the UTF-16 NUL terminator → effectively empty.
     if ok.is_err() || bytes <= 2 {
         return None;
@@ -83,8 +82,8 @@ fn query_session_string(session_id: u32, info_class: WTS_INFO_CLASS) -> Option<S
 /// Returns `None` on any failure (unknown account, marshalling error, etc.).
 fn resolve_sid(account: &str) -> Option<String> {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
-    use windows::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
     use windows::core::{HSTRING, PCWSTR};
 
     let name = HSTRING::from(account);
@@ -164,8 +163,7 @@ pub(super) fn sessions() -> Result<Vec<Value>, String> {
     // SAFETY: hServer = None → local server. `p_sessions` receives an array
     // of `count` WTS_SESSION_INFOW structs allocated by WTSAPI; it must be
     // released with WTSFreeMemory after use.
-    let ok =
-        unsafe { WTSEnumerateSessionsW(None, 0, 1, &mut p_sessions, &mut count) };
+    let ok = unsafe { WTSEnumerateSessionsW(None, 0, 1, &mut p_sessions, &mut count) };
     if ok.is_err() {
         // SAFETY: GetLastError is always safe to call immediately after a
         // failed Win32 API.

@@ -84,9 +84,8 @@ pub(super) fn subkey_names(hive: &str, key: &str) -> Vec<String> {
     let mut hkey = HKEY::default();
     let key_w: HSTRING = key.into();
     // SAFETY: HSTRING lives for the call; KEY_READ is a non-destructive flag.
-    let opened = unsafe {
-        RegOpenKeyExW(root, PCWSTR(key_w.as_ptr()), None, KEY_READ, &mut hkey).is_ok()
-    };
+    let opened =
+        unsafe { RegOpenKeyExW(root, PCWSTR(key_w.as_ptr()), None, KEY_READ, &mut hkey).is_ok() };
     if !opened {
         return Vec::new();
     }
@@ -123,7 +122,9 @@ pub(super) fn subkey_names(hive: &str, key: &str) -> Vec<String> {
 
     // SAFETY: hkey was opened successfully; RegCloseKey never fails for a
     // handle returned by RegOpenKeyExW.
-    unsafe { let _ = RegCloseKey(hkey); }
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
     names
 }
 

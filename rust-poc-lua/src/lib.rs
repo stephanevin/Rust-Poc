@@ -1,4 +1,4 @@
-//! In-process Lua 5.4 collector runtime + 28 `host.*` bindings.
+//! In-process Lua 5.4 collector runtime + 41 `host.*` bindings.
 //!
 //! This crate is **Windows-only** (real impl). On every other target
 //! (Linux dev/CI, macOS until macOS host bindings exist) it compiles to
@@ -80,6 +80,12 @@ mod tls;
 // Mirrors the 6 C# transformers in DataTransformers/Regional via Win32 NLS APIs.
 #[cfg(windows)]
 mod regional;
+// `accounts` exposes host bindings for the Accounts section of ComplianceApp:
+// user profiles (registry ProfileList), local user accounts (NetUserEnum +
+// NetUserGetInfo level 4), and local group members (NetLocalGroupGetMembers
+// level 2).  Deviations #19–#21.
+#[cfg(windows)]
+mod accounts;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

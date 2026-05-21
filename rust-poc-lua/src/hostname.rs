@@ -81,10 +81,8 @@ fn get_computer_name(format: COMPUTER_NAME_FORMAT) -> Result<String, String> {
     // probe. On success `size` is overwritten with the length WITHOUT the
     // trailing NUL — we truncate to that value before decoding. Same
     // `&raw mut size` rationale as the sizing probe above.
-    unsafe {
-        GetComputerNameExW(format, Some(PWSTR(buf.as_mut_ptr())), &raw mut size)
-    }
-    .map_err(|e| format!("GetComputerNameExW({format:?}): {e}"))?;
+    unsafe { GetComputerNameExW(format, Some(PWSTR(buf.as_mut_ptr())), &raw mut size) }
+        .map_err(|e| format!("GetComputerNameExW({format:?}): {e}"))?;
 
     buf.truncate(size as usize);
     OsString::from_wide(&buf)

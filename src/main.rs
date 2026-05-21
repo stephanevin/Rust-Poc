@@ -1,4 +1,4 @@
-//! `collect-config` — runs a Lua collector script against the local host.
+//! `collect-config` — runs one or all Lua collector scripts against the local host.
 //!
 //! Root binary of the workspace. Loads `collectors/<script_name>`,
 //! executes its global `collect()` function in a sandboxed mlua VM
@@ -12,8 +12,9 @@
 //! ## Usage
 //!
 //! ```text
-//! cargo run -- general.lua
-//! cargo run -- general.lua some-perimeter
+//! cargo run                          # run ALL *.lua collectors, combined JSON
+//! cargo run -- general.lua           # run a single collector
+//! cargo run -- general.lua perimeter # single collector + perimeter
 //! ```
 //!
 //! Logs and progress go to stderr (plus a JSON daily-rolling file under
@@ -21,9 +22,25 @@
 //! JSON result goes to stdout, so the binary is pipe-friendly:
 //!
 //! ```text
-//! cargo run --quiet -- general.lua > config.json
+//! cargo run --quiet > all.json
 //! cargo run --quiet -- general.lua | jq '.machine_name'
 //! ```
+//!
+//! ## Combined output format (no-arg mode)
+//!
+//! When invoked with no arguments, every `*.lua` file found in
+//! `collectors/` is executed in alphabetical order. The results are
+//! merged into a single JSON object keyed by script stem:
+//!
+//! ```json
+//! {
+//!   "accounts": { "user_profiles": [...], ... },
+//!   "general":  { "machine_name": "...", ... }
+//! }
+//! ```
+//!
+//! Per-script errors are folded in-band (`{"_error": "<msg>"}`) so the
+//! combined run always succeeds (exit 0) even when one script fails.
 //!
 //! ## Per-run output file
 //!
@@ -37,10 +54,12 @@
 //! the rest of the run still succeeds (the stdout JSON is the primary
 //! contract).
 //!
+//! In combined mode, the output file is named `all_<hostname>_<timestamp>.json`.
+//!
 //! ## Exit codes
 //!
-//! - `0` — success
-//! - `1` — Lua runtime error (script error, missing file at run time, timeout)
+//! - `0` — success (including combined-mode partial failures folded into JSON)
+//! - `1` — Lua runtime error (single-script mode only)
 //! - `2` — cannot read hostname
 //! - `3` — cannot serialize Lua output to JSON
 //! - `4` — script path escapes the `collectors/` directory (path traversal rejected)
@@ -70,19 +89,10 @@ async fn main() -> ExitCode {
     let (_log_guard, log_dir) = logging::init();
 
     let args: Vec<String> = std::env::args().collect();
-    let script = args.get(1).cloned().unwrap_or_else(|| "general.lua".into());
+    let script_arg = args.get(1).cloned();
     let perimeter = args.get(2).map(String::as_str);
 
     let cache_dir = PathBuf::from("collectors");
-
-    // Reject any script path that would escape ./collectors/ before we
-    // hand the string to InternalRuntime::run. The engine itself
-    // (verbatim port from sdh-fleet-client) trusts its caller — the
-    // trust boundary for user input lives here.
-    if let Err(e) = resolve_script_path(&cache_dir, &script) {
-        eprintln!("collect-config: {e}");
-        return ExitCode::from(4);
-    }
 
     // `hostname::get` is the cross-platform way to read the machine
     // name (GetComputerNameW on Windows, gethostname() on Unix). The
@@ -96,23 +106,53 @@ async fn main() -> ExitCode {
     };
 
     let runtime = InternalRuntime::new(
-        cache_dir,
+        cache_dir.clone(),
         hostname.clone(),
         env!("CARGO_PKG_VERSION").to_string(),
     );
 
-    eprintln!(
-        "collect-config: running {script} (perimeter={})",
-        perimeter.unwrap_or("<none>")
-    );
+    if let Some(script) = script_arg {
+        // --- Single-script mode (existing behaviour) ----------------------
+        // Reject any script path that would escape ./collectors/ before we
+        // hand the string to InternalRuntime::run. The engine itself
+        // (verbatim port from sdh-fleet-client) trusts its caller — the
+        // trust boundary for user input lives here.
+        if let Err(e) = resolve_script_path(&cache_dir, &script) {
+            eprintln!("collect-config: {e}");
+            return ExitCode::from(4);
+        }
 
-    match runtime
-        .run(&script, perimeter, Duration::from_secs(30))
-        .await
-    {
-        Ok(value) => match serde_json::to_string_pretty(&value) {
+        eprintln!(
+            "collect-config: running {script} (perimeter={})",
+            perimeter.unwrap_or("<none>")
+        );
+
+        match runtime
+            .run(&script, perimeter, Duration::from_secs(30))
+            .await
+        {
+            Ok(value) => match serde_json::to_string_pretty(&value) {
+                Ok(json) => {
+                    write_output_file(&log_dir, &script, &hostname, &json);
+                    println!("{json}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("collect-config: serialize output: {e}");
+                    ExitCode::from(3)
+                }
+            },
+            Err(e) => {
+                eprintln!("collect-config: {e}");
+                ExitCode::from(1)
+            }
+        }
+    } else {
+        // --- Combined mode: run every *.lua in collectors/ ----------------
+        let value = run_all_collectors(&runtime, &cache_dir).await;
+        match serde_json::to_string_pretty(&value) {
             Ok(json) => {
-                write_output_file(&log_dir, &script, &hostname, &json);
+                write_output_file(&log_dir, "all", &hostname, &json);
                 println!("{json}");
                 ExitCode::SUCCESS
             }
@@ -120,12 +160,70 @@ async fn main() -> ExitCode {
                 eprintln!("collect-config: serialize output: {e}");
                 ExitCode::from(3)
             }
-        },
-        Err(e) => {
-            eprintln!("collect-config: {e}");
-            ExitCode::from(1)
         }
     }
+}
+
+/// Runs every `*.lua` file found in `cache_dir` (alphabetically) and merges
+/// the results into a single JSON object keyed by script stem.
+///
+/// Errors from individual scripts are folded in-band as
+/// `{"_error": "<message>"}` so the combined run never aborts early.
+async fn run_all_collectors(runtime: &InternalRuntime, cache_dir: &Path) -> serde_json::Value {
+    // Collect and sort script file names for deterministic output order.
+    // Surface a clear error when the collectors directory is missing or
+    // unreadable rather than silently returning an empty object.
+    let read_result = std::fs::read_dir(cache_dir);
+    if let Err(ref e) = read_result {
+        eprintln!(
+            "collect-config: cannot read collectors directory {}: {e}",
+            cache_dir.display()
+        );
+    }
+
+    let mut scripts: Vec<String> = read_result
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()?.to_str()? == "lua" {
+                path.file_name()?.to_str().map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+    scripts.sort();
+
+    if scripts.is_empty() {
+        eprintln!(
+            "collect-config: no *.lua scripts found in {}",
+            cache_dir.display()
+        );
+    }
+
+    let mut combined = serde_json::Map::new();
+
+    for script in &scripts {
+        let stem = Path::new(script)
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or(script.as_str());
+
+        eprintln!("collect-config: running {script}");
+
+        let result = runtime
+            .run(script, None, Duration::from_secs(30))
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("collect-config: {script}: {e}");
+                serde_json::json!({ "_error": e.to_string() })
+            });
+
+        combined.insert(stem.to_string(), result);
+    }
+
+    serde_json::Value::Object(combined)
 }
 
 /// Writes `json` to a per-run audit file under `log_dir`. Best-effort:

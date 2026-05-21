@@ -22,8 +22,7 @@ use super::winver::filetime_to_iso8601;
 // Registry root constants
 // ---------------------------------------------------------------------------
 
-const GP_STATE_ROOT: &str =
-    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State";
+const GP_STATE_ROOT: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State";
 
 const GP_STATUS_EXTENSIONS: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\Status\GPExtensions";
@@ -377,18 +376,15 @@ fn read_u32(hive: &str, key: &str, value: &str) -> Option<u32> {
 /// Uses explicit type arms to avoid `serde_json::Value::to_string()`, which
 /// would wrap string values in extra JSON quotation marks.
 fn read_status_string(hive: &str, key: &str) -> Option<String> {
-    registry::read(hive, key, "Status")
-        .ok()
-        .flatten()
-        .map(|v| {
-            if let Some(n) = v.as_u64() {
-                n.to_string()
-            } else if let Some(s) = v.as_str() {
-                s.to_string()
-            } else {
-                v.to_string()
-            }
-        })
+    registry::read(hive, key, "Status").ok().flatten().map(|v| {
+        if let Some(n) = v.as_u64() {
+            n.to_string()
+        } else if let Some(s) = v.as_str() {
+            s.to_string()
+        } else {
+            v.to_string()
+        }
+    })
 }
 
 /// Strips the `LDAP://` scheme prefix (case-insensitive) from a SOM path.
@@ -460,10 +456,7 @@ static EXTENSION_NAME_MAP: std::sync::LazyLock<
             "{6A4C88C6-C502-4F74-8F60-2CB23EDC24E2}",
             "Preference Network Shares",
         ),
-        (
-            "{7150F9BF-48AD-4DA4-A49C-29EF4A8369BA}",
-            "Preference Files",
-        ),
+        ("{7150F9BF-48AD-4DA4-A49C-29EF4A8369BA}", "Preference Files"),
         (
             "{728EE579-943C-4519-9EF7-AB56765798ED}",
             "Preference Data Sources",
@@ -551,10 +544,7 @@ static EXTENSION_NAME_MAP: std::sync::LazyLock<
             "{F9C77450-3A41-477E-9310-9ACD617BD9E3}",
             "Group Policy Applications",
         ),
-        (
-            "{FB2CA36D-0B40-4307-821B-A13B252DE56C}",
-            "Enterprise QoS",
-        ),
+        ("{FB2CA36D-0B40-4307-821B-A13B252DE56C}", "Enterprise QoS"),
     ])
 });
 
@@ -616,10 +606,7 @@ mod tests {
 
     #[test]
     fn normalize_strips_lowercase_ldap() {
-        assert_eq!(
-            normalize_som("ldap://OU=Test,DC=corp"),
-            "OU=Test,DC=corp"
-        );
+        assert_eq!(normalize_som("ldap://OU=Test,DC=corp"), "OU=Test,DC=corp");
     }
 
     #[test]
@@ -682,16 +669,11 @@ mod tests {
         let gpo_id = "6AC1786C-016F-11D2-945F-00C04fB984F9";
         let links = vec![GpLink {
             id: 3,
-            ds_path: format!(
-                "cn={gpo_id},cn=policies,cn=system,DC=corp,DC=local"
-            ),
+            ds_path: format!("cn={gpo_id},cn=policies,cn=system,DC=corp,DC=local"),
             som: "DC=corp,DC=local".to_string(),
             is_loopback: 0,
         }];
-        assert_eq!(
-            resolve_link_order(&links, 0, "DC=corp,DC=local", gpo_id),
-            3
-        );
+        assert_eq!(resolve_link_order(&links, 0, "DC=corp,DC=local", gpo_id), 3);
     }
 
     #[test]

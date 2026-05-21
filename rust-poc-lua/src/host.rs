@@ -15,7 +15,7 @@ use mlua::{
     AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value,
 };
 
-use super::{ad, gpo, net, registry, regional, tls, winver, wmi::Wmi, wnf, wts};
+use super::{accounts, ad, gpo, net, regional, registry, tls, winver, wmi::Wmi, wnf, wts};
 
 /// Per-run mutable state passed into binding closures. Lua is !Send, so
 /// this lives on the blocking thread that owns the Lua VM.
@@ -96,6 +96,7 @@ pub(super) fn install(
     install_gpo_bindings(lua, &host, &state)?;
     install_tls_bindings(lua, &host, &state)?;
     install_regional_bindings(lua, &host, &state)?;
+    install_accounts_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -320,21 +321,57 @@ fn bind_hostname(
 }
 
 fn install_hostname_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
-    bind_hostname(lua, host, state, "netbios_name", super::hostname::netbios_name)?;
-    bind_hostname(lua, host, state, "host_name",    super::hostname::dns_hostname)?;
-    bind_hostname(lua, host, state, "fqdn",         super::hostname::dns_fqdn)?;
+    bind_hostname(
+        lua,
+        host,
+        state,
+        "netbios_name",
+        super::hostname::netbios_name,
+    )?;
+    bind_hostname(lua, host, state, "host_name", super::hostname::dns_hostname)?;
+    bind_hostname(lua, host, state, "fqdn", super::hostname::dns_fqdn)?;
     Ok(())
 }
 
 fn install_ad_computer_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
-    bind_hostname(lua, host, state, "ad_computer_sam",  super::adcomputer::sam_name)?;
-    bind_hostname(lua, host, state, "ad_computer_dn",   super::adcomputer::distinguished_name)?;
-    bind_hostname(lua, host, state, "ad_computer_cn",   super::adcomputer::canonical_name)?;
-    bind_hostname(lua, host, state, "ad_computer_site", super::adcomputer::site_name)?;
+    bind_hostname(
+        lua,
+        host,
+        state,
+        "ad_computer_sam",
+        super::adcomputer::sam_name,
+    )?;
+    bind_hostname(
+        lua,
+        host,
+        state,
+        "ad_computer_dn",
+        super::adcomputer::distinguished_name,
+    )?;
+    bind_hostname(
+        lua,
+        host,
+        state,
+        "ad_computer_cn",
+        super::adcomputer::canonical_name,
+    )?;
+    bind_hostname(
+        lua,
+        host,
+        state,
+        "ad_computer_site",
+        super::adcomputer::site_name,
+    )?;
     // UPN of the current user — exposed as `mail_address` because the UPN
     // (user@domain.com) is the best offline proxy for the Exchange `mail`
     // LDAP attribute. See adcomputer::user_upn() doc for the UPN ≠ mail caveat.
-    bind_hostname(lua, host, state, "mail_address",     super::adcomputer::user_upn)?;
+    bind_hostname(
+        lua,
+        host,
+        state,
+        "mail_address",
+        super::adcomputer::user_upn,
+    )?;
     Ok(())
 }
 
@@ -427,7 +464,8 @@ fn install_gpo_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<(
                 } else {
                     s.borrow_mut().record_error(
                         "ad_user_gpos",
-                        "Group Policy State registry key absent (GP never applied on this machine)".to_string(),
+                        "Group Policy State registry key absent (GP never applied on this machine)"
+                            .to_string(),
                     );
                     Ok(mlua::Value::Nil)
                 }
@@ -446,7 +484,8 @@ fn install_gpo_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<(
                 } else {
                     s.borrow_mut().record_error(
                         "gp_extensions_status",
-                        "Core GP extension key absent (GP never applied on this machine)".to_string(),
+                        "Core GP extension key absent (GP never applied on this machine)"
+                            .to_string(),
                     );
                     Ok(mlua::Value::Nil)
                 }
@@ -559,6 +598,61 @@ fn install_regional_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
                         "GetSystemDefaultLocaleName returned no value".to_string(),
                     );
                     Ok(None)
+                }
+            })?,
+        )?;
+    }
+
+    Ok(())
+}
+
+// --- Accounts (user profiles / local users / group members) -----------
+
+fn install_accounts_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.user_profiles() — registry ProfileList + LookupAccountSidW.
+    // Mirrors UserProfiles.cs from ComplianceApp DataTransformers/Accounts.
+    // Always returns an array (empty when ProfileList key is absent).
+    host.set(
+        "user_profiles",
+        lua.create_function(|lua, ()| {
+            lua.to_value(&serde_json::Value::Array(accounts::user_profiles()))
+        })?,
+    )?;
+
+    // host.local_user_accounts() — NetUserEnum(0) + NetUserGetInfo(4).
+    // Mirrors LocalAccountsUsers.cs.
+    {
+        let s = state.clone();
+        host.set(
+            "local_user_accounts",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match accounts::local_user_accounts() {
+                    Ok(rows) => lua.to_value(&serde_json::Value::Array(rows)),
+                    Err(e) => {
+                        st.record_error("local_user_accounts", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.local_group_members(sid) — LookupAccountSidW + NetLocalGroupGetMembers(2).
+    // Mirrors LocalAccountsAdminMembers.cs (S-1-5-32-544) and
+    // LocalAccountsRdpMembers.cs (S-1-5-32-555) — same binding, different SID.
+    {
+        let s = state.clone();
+        host.set(
+            "local_group_members",
+            lua.create_function(move |lua, group_sid: String| {
+                let mut st = s.borrow_mut();
+                match accounts::local_group_members(&group_sid) {
+                    Ok(rows) => lua.to_value(&serde_json::Value::Array(rows)),
+                    Err(e) => {
+                        st.record_error(&format!("local_group_members:{group_sid}"), e);
+                        Ok(Value::Nil)
+                    }
                 }
             })?,
         )?;
@@ -926,7 +1020,8 @@ fn detect_virtual_machine(st: &mut HostState) -> bool {
     if model == "Virtual Machine"       // Hyper-V guest
         || model.contains("VMware")     // VMware Workstation / ESXi
         || model.contains("VirtualBox") // Oracle VirtualBox
-        || model.contains("QEMU")       // KVM / QEMU
+        || model.contains("QEMU")
+    // KVM / QEMU
     {
         return true;
     }

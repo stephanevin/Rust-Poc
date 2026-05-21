@@ -90,9 +90,8 @@ fn get_object_name(format: EXTENDED_NAME_FORMAT) -> Result<String, String> {
     // SAFETY: `buf` holds exactly `size` WCHARs as reported by the sizing
     // probe. On success `size` is overwritten with the length WITHOUT the
     // trailing NUL — truncate before decoding.
-    let ok = unsafe {
-        GetComputerObjectNameW(format, Some(PWSTR(buf.as_mut_ptr())), &raw mut size)
-    };
+    let ok =
+        unsafe { GetComputerObjectNameW(format, Some(PWSTR(buf.as_mut_ptr())), &raw mut size) };
     if !ok {
         // SAFETY: called immediately after the failed Win32 function, on the
         // same thread, so `from_thread()` captures the correct last-error.
@@ -123,8 +122,7 @@ fn get_object_name(format: EXTENDED_NAME_FORMAT) -> Result<String, String> {
 /// first GP cycle) the key does not exist — this function returns `Err` in
 /// that case.
 fn gp_state_machine(value_name: &str) -> Result<String, String> {
-    const KEY: &str =
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\Machine";
+    const KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\Machine";
     match super::registry::read("HKLM", KEY, value_name) {
         Ok(Some(serde_json::Value::String(s))) => Ok(s),
         Ok(_) => Err(format!(
@@ -153,8 +151,7 @@ pub(super) fn sam_name() -> Result<String, String> {
 /// (e.g. Netlogon not yet authenticated). Mirrors the C# fallback chain
 /// in `ActiveDirectory.cs`.
 pub(super) fn distinguished_name() -> Result<String, String> {
-    get_object_name(NameFullyQualifiedDN)
-        .or_else(|_| gp_state_machine("Distinguished-Name"))
+    get_object_name(NameFullyQualifiedDN).or_else(|_| gp_state_machine("Distinguished-Name"))
 }
 
 /// Returns the canonical name of the local computer account.
@@ -299,7 +296,10 @@ mod tests {
         if let Ok(s) = sam_name() {
             assert!(!s.is_empty(), "SAM name must not be empty");
             assert!(s.contains('\\'), "SAM name must contain a backslash: {s:?}");
-            assert!(s.ends_with('$'), "computer SAM name must end with '$': {s:?}");
+            assert!(
+                s.ends_with('$'),
+                "computer SAM name must end with '$': {s:?}"
+            );
         }
         // Err(_) => workgroup machine or Netlogon not cached — linkage verified
     }
@@ -340,10 +340,7 @@ mod tests {
     fn user_upn_smoke() {
         if let Ok(s) = user_upn() {
             assert!(!s.is_empty(), "UPN must not be empty");
-            assert!(
-                s.contains('@'),
-                "UPN must contain '@' separator: {s:?}"
-            );
+            assert!(s.contains('@'), "UPN must contain '@' separator: {s:?}");
         }
         // Err(_) => workgroup or user not domain-authenticated — linkage verified
     }
