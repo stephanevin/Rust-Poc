@@ -151,6 +151,17 @@ function collect()
     -- Group Policy\Status\GPExtensions + Group Policy\State\Machine\Extension-List.
     -- Mirrors GpExtensionsStatus.cs / DataService.GetGpExtensionsStatus().
     gp_extensions_status      = host.gp_extensions_status(),
+    tls_cipher_suites         = host.tls_cipher_suites(),
+    -- Regional / locale (Win32 NLS APIs — mirrors DataTransformers/Regional in ComplianceApp).
+    -- Note: user_* values are token-sensitive; running as LocalSystem returns .DEFAULT hive locale.
+    -- BCP-47 UI language of the current user (e.g. "fr-FR").  Mirrors MuiLang.cs.
+    user_ui_language          = host.user_ui_language(),
+    -- BCP-47 UI language of the OS installation (e.g. "en-US").  Mirrors SystemDefaultLanguage.cs.
+    system_ui_language        = host.system_ui_language(),
+    -- BCP-47 regional locale of the current user — date/number format (e.g. "fr-CH").  Mirrors CurrentCulture.cs.
+    user_locale               = host.user_locale(),
+    -- BCP-47 system-wide regional locale (e.g. "en-US").  Mirrors SystemCulture.cs.
+    system_locale             = host.system_locale(),
     os_install_date           = setup.install_date,
     os_setup_snapshot_history = setup.history or {},
     os_file_rename_pending    = pending_count > 0,

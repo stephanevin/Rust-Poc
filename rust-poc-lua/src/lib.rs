@@ -71,6 +71,15 @@ mod wnf;
 // status, reading from the Group Policy registry State / Status hives.
 #[cfg(windows)]
 mod gpo;
+// `tls` exposes host.tls_cipher_suites() via BCryptEnumContextFunctions —
+// returns the effective Schannel cipher suite list (local + GP merged).
+#[cfg(windows)]
+mod tls;
+// `regional` exposes host bindings for regional/locale information:
+// user and system UI language, user and system locale, keyboard layouts.
+// Mirrors the 6 C# transformers in DataTransformers/Regional via Win32 NLS APIs.
+#[cfg(windows)]
+mod regional;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

@@ -229,7 +229,7 @@ rust-poc-lua/src/
 └── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 33 `host.*` bindings exposed to Lua
+### The 38 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -265,6 +265,11 @@ rust-poc-lua/src/
 | `host.ad_computer_gpos()` **(deviation #11)** | Registry `Group Policy\State\Machine\GPO-List` + `GPLink-List` — mirrors `AdComputerGpos.cs` | `array<{context, link_order, gpo_name, gpo_id, filtering, scope_of_management, revision}>?` |
 | `host.ad_user_gpos()` **(deviation #12)** | Registry `Group Policy\State\{SID}\GPO-List` (all non-Machine contexts) — mirrors `AdUserGpos.cs` | `array<{context, link_order, gpo_name, gpo_id, filtering, scope_of_management, revision, is_loopback}>?` |
 | `host.gp_extensions_status()` **(deviation #13)** | Registry `Group Policy\State\Machine\Extension-List` + `Group Policy\Status\GPExtensions` — mirrors `GpExtensionsStatus.cs` | `array<{id, name, status, last_policy_time}>?` |
+| `host.tls_cipher_suites()` **(deviation #14)** | `BCryptEnumContextFunctions(CRYPT_LOCAL, "SSL", NCRYPT_SCHANNEL_INTERFACE)` — effective Schannel cipher suite list (local + GP merged), mirrors `OSTlsCipherSuite.cs` / `BCrypt.cs` | `array<string>?` |
+| `host.user_ui_language()` **(deviation #15)** | `GetUserDefaultUILanguage()` → `LCIDToLocaleName` — BCP-47 UI language of the current user (token-sensitive); mirrors `MuiLang.cs` / `UserDefaultLanguage.cs` | `string?` |
+| `host.system_ui_language()` **(deviation #16)** | `GetSystemDefaultUILanguage()` → `LCIDToLocaleName` — BCP-47 UI language of the OS installation (token-independent); mirrors `SystemDefaultLanguage.cs` | `string?` |
+| `host.user_locale()` **(deviation #17)** | `GetUserDefaultLocaleName()` — BCP-47 regional locale (date/number format) of the current user (token-sensitive); mirrors `CurrentCulture.cs` | `string?` |
+| `host.system_locale()` **(deviation #18)** | `GetSystemDefaultLocaleName()` — BCP-47 system-wide regional locale (token-independent); mirrors `SystemCulture.cs` | `string?` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and

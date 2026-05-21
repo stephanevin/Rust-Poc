@@ -15,7 +15,7 @@ use mlua::{
     AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value,
 };
 
-use super::{ad, gpo, net, registry, winver, wmi::Wmi, wnf, wts};
+use super::{ad, gpo, net, registry, regional, tls, winver, wmi::Wmi, wnf, wts};
 
 /// Per-run mutable state passed into binding closures. Lua is !Send, so
 /// this lives on the blocking thread that owns the Lua VM.
@@ -94,6 +94,8 @@ pub(super) fn install(
     install_setup_history(lua, &host)?;
     install_wnf_bindings(lua, &host, &state)?;
     install_gpo_bindings(lua, &host, &state)?;
+    install_tls_bindings(lua, &host, &state)?;
+    install_regional_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -447,6 +449,116 @@ fn install_gpo_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<(
                         "Core GP extension key absent (GP never applied on this machine)".to_string(),
                     );
                     Ok(mlua::Value::Nil)
+                }
+            })?,
+        )?;
+    }
+
+    Ok(())
+}
+
+// --- TLS (Schannel cipher suites) --------------------------------------
+
+fn install_tls_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        "tls_cipher_suites",
+        lua.create_function(move |lua, ()| {
+            if let Some(suites) = tls::tls_cipher_suites() {
+                let arr: Vec<serde_json::Value> =
+                    suites.into_iter().map(serde_json::Value::String).collect();
+                lua.to_value(&serde_json::Value::Array(arr))
+            } else {
+                s.borrow_mut().record_error(
+                    "tls_cipher_suites",
+                    "BCryptEnumContextFunctions(CRYPT_LOCAL, SSL, NCRYPT_SCHANNEL_INTERFACE) failed".to_string(),
+                );
+                Ok(mlua::Value::Nil)
+            }
+        })?,
+    )?;
+    Ok(())
+}
+
+// --- Regional (locale / UI language) ----------------------------------
+
+fn install_regional_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.user_ui_language() — BCP-47 UI language of the current user.
+    // Mirrors MuiLang.cs / UserDefaultLanguage.cs (BCP-47 instead of English name).
+    {
+        let s = state.clone();
+        host.set(
+            "user_ui_language",
+            lua.create_function(move |_, ()| {
+                if let Some(v) = regional::user_ui_language() {
+                    Ok(Some(v))
+                } else {
+                    s.borrow_mut().record_error(
+                        "user_ui_language",
+                        "GetUserDefaultUILanguage / LCIDToLocaleName returned no value".to_string(),
+                    );
+                    Ok(None)
+                }
+            })?,
+        )?;
+    }
+
+    // host.system_ui_language() — BCP-47 UI language of the OS installation.
+    // Mirrors SystemDefaultLanguage.cs.
+    {
+        let s = state.clone();
+        host.set(
+            "system_ui_language",
+            lua.create_function(move |_, ()| {
+                if let Some(v) = regional::system_ui_language() {
+                    Ok(Some(v))
+                } else {
+                    s.borrow_mut().record_error(
+                        "system_ui_language",
+                        "GetSystemDefaultUILanguage / LCIDToLocaleName returned no value"
+                            .to_string(),
+                    );
+                    Ok(None)
+                }
+            })?,
+        )?;
+    }
+
+    // host.user_locale() — BCP-47 regional locale of the current user.
+    // Mirrors CurrentCulture.cs.
+    {
+        let s = state.clone();
+        host.set(
+            "user_locale",
+            lua.create_function(move |_, ()| {
+                if let Some(v) = regional::user_locale() {
+                    Ok(Some(v))
+                } else {
+                    s.borrow_mut().record_error(
+                        "user_locale",
+                        "GetUserDefaultLocaleName returned no value".to_string(),
+                    );
+                    Ok(None)
+                }
+            })?,
+        )?;
+    }
+
+    // host.system_locale() — BCP-47 system-wide regional locale.
+    // Mirrors SystemCulture.cs.
+    {
+        let s = state.clone();
+        host.set(
+            "system_locale",
+            lua.create_function(move |_, ()| {
+                if let Some(v) = regional::system_locale() {
+                    Ok(Some(v))
+                } else {
+                    s.borrow_mut().record_error(
+                        "system_locale",
+                        "GetSystemDefaultLocaleName returned no value".to_string(),
+                    );
+                    Ok(None)
                 }
             })?,
         )?;
