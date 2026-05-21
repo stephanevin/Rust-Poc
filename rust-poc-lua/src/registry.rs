@@ -9,8 +9,9 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_MULTI_SZ,
-    REG_QWORD, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, REG_DWORD, REG_EXPAND_SZ,
+    REG_MULTI_SZ, REG_QWORD, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+    RegQueryValueExW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
@@ -20,6 +21,7 @@ pub(super) fn read(hive: &str, key: &str, value: &str) -> Result<Option<Value>, 
     let root: HKEY = match hive {
         "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
         "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
+        "HKU" | "HKEY_USERS" => HKEY_USERS,
         other => return Err(format!("unsupported hive: {other}")),
     };
 
@@ -78,6 +80,7 @@ pub(super) fn subkey_names(hive: &str, key: &str) -> Vec<String> {
     let root: HKEY = match hive {
         "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
         "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
+        "HKU" | "HKEY_USERS" => HKEY_USERS,
         _ => return Vec::new(),
     };
 

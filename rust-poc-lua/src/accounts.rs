@@ -278,6 +278,71 @@ fn sid_name_use_label(code: i32) -> &'static str {
     }
 }
 
+// --- Shared helpers (pub(crate)) -----------------------------------------
+
+/// Expands `%VARNAME%` placeholders in a Windows registry path string.
+///
+/// Delegates to [`std::env::var`], which calls `GetEnvironmentVariableW` on
+/// Windows — the lookup is therefore **case-insensitive** (`%systemroot%` and
+/// `%SystemRoot%` both resolve).  Unknown variable names are left unexpanded.
+/// Returns the original string unchanged when it contains no `%` characters
+/// (fast path).
+fn expand_env_vars(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let mut result = s.to_string();
+    // Guard against infinite loops on pathological inputs (nested / unclosed).
+    for _ in 0..16 {
+        let Some(start) = result.find('%') else { break };
+        let after = &result[start + 1..];
+        let Some(rel_end) = after.find('%') else { break };
+        let var_name = &after[..rel_end];
+        if var_name.is_empty() {
+            break;
+        }
+        match std::env::var(var_name) {
+            Ok(value) => {
+                let placeholder = format!("%{var_name}%");
+                result = result.replacen(&placeholder, &value, 1);
+            }
+            Err(_) => break,
+        }
+    }
+    result
+}
+
+/// Returns all domain user profiles registered in
+/// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`
+/// as `(sid, nt_account, profile_image_path)` tuples.
+///
+/// Filters out well-known system SIDs (`S-1-5-18/19/20`) and entries without
+/// a `ProfileImagePath`.  This is the minimal profile data consumed by
+/// `software::browser_extensions_installed` and `software::ide_extensions_installed`.
+///
+/// Returns an empty `Vec` when the key is absent.
+pub(crate) fn profile_list() -> Vec<(String, String, std::path::PathBuf)> {
+    const PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+
+    let sids = super::registry::subkey_names("HKLM", PROFILE_LIST);
+    let mut result = Vec::with_capacity(sids.len());
+
+    for sid in &sids {
+        if SYSTEM_SIDS.contains(&sid.as_str()) {
+            continue;
+        }
+        let key = format!("{PROFILE_LIST}\\{sid}");
+        let Some(path_str) = read_str("HKLM", &key, "ProfileImagePath") else {
+            continue;
+        };
+        let nt_account = sid_string_to_nt_account(sid).unwrap_or_default();
+        let expanded = expand_env_vars(&path_str);
+        result.push((sid.clone(), nt_account, std::path::PathBuf::from(expanded)));
+    }
+
+    result
+}
+
 // --- Public bindings -----------------------------------------------------
 
 /// Returns all Windows user profiles registered in

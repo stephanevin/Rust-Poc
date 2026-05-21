@@ -43,6 +43,7 @@ windows = { version = "0.62", features = [
     "Win32_Security_Cryptography",               # BCryptEnumContextFunctions + BCryptFreeBuffer
     "Win32_Globalization",                        # GetUser/SystemDefaultUILanguage, GetUser/SystemDefaultLocaleName, LCIDToLocaleName
     "Win32_System_RemoteDesktop",
+    "Win32_System_Services",                  # OpenSCManagerW, EnumServicesStatusExW, SC_HANDLE
     "Wdk",
     "Wdk_System",
     "Wdk_System_SystemInformation",

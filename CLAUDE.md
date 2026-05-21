@@ -74,7 +74,7 @@ structure of `sdh-fleet-client`:
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 41 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 45 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
 | **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
@@ -218,7 +218,7 @@ rust-poc-lua/src/
 ├── lib.rs          # Public API + non-Windows stub
 ├── runtime.rs      # InternalRuntime::run — async, tokio::spawn_blocking + timeout
 ├── sandbox.rs      # Strips io/dofile/require/etc. globals
-├── host.rs         # 41 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── host.rs         # 45 `host.*` bindings + HostState (Rc<RefCell<..>>)
 ├── wmi.rs          # COMLibrary + WMIConnection + per-class cache
 ├── registry.rs     # RegOpenKeyExW + RegQueryValueExW + REG_* decode
 ├── net.rs          # GetAdaptersAddresses + IPv4 enumeration
@@ -229,7 +229,7 @@ rust-poc-lua/src/
 └── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 41 `host.*` bindings exposed to Lua
+### The 45 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -273,6 +273,10 @@ rust-poc-lua/src/
 | `host.user_profiles()` **(deviation #19)** | Registry `ProfileList\*` + `LookupAccountSidW` — Windows user profiles with SID, NTAccount, path, load/unload FILETIME; mirrors `UserProfiles.cs` | `array<{sid, nt_account, profile_image_path, local_profile_load_time?, local_profile_unload_time?}>` |
 | `host.local_user_accounts()` **(deviation #20)** | `NetUserEnum(level=0)` + `NetUserGetInfo(level=4)` — local accounts with flags, timestamps, SID from `usri4_user_sid`; mirrors `LocalAccountsUsers.cs` | `array<{name, full_name, description, domain, sid, disabled, lockout, …}>?` |
 | `host.local_group_members(sid)` **(deviation #21)** | `LookupAccountSidW` (group name) + `NetLocalGroupGetMembers(level=2)` + `ConvertSidToStringSidW` (members); mirrors `LocalAccountsAdminMembers.cs` / `LocalAccountsRdpMembers.cs` | `array<{name, domain, caption, sid, sid_type: string, local_account}>?` |
+| `host.os_software_installed()` **(deviation #22)** | Registry `Uninstall\*` (HKLM 64-bit + WOW6432Node) + `HKEY_USERS\{SID}\…\Uninstall` for **Active** WTS domain sessions; deduplicates on `(context, publisher, display_name, version, software_code)`, no HKLM persistence snapshot; mirrors `OSSoftwareInstalled.cs` | `array<{context, system_component, publisher, display_name, version, install_date, software_code}>` |
+| `host.os_services()` **(deviation #23)** | Win32 SC Manager APIs (`OpenSCManagerW` + `EnumServicesStatusExW` + `QueryServiceConfigW` + `QueryServiceConfig2W`) instead of WMI `Win32_Service` — lower overhead, no COM marshalling; mirrors `OSServices.cs` | `array<{display_name, start_mode, delayed_auto_start, state, start_name, path_name, name}>?` |
+| `host.browser_extensions_installed()` **(deviation #24)** | Chromium `Preferences` + `Secure Preferences` parsed as `ChromiumPreferencesParser`; 7 browsers (Edge, Chrome, Brave, Vivaldi, Arc, Opera, Opera GX); `_locales/en/messages.json` NLS resolution; mirrors `BrowserExtensionsInstalled.cs` + `ChromiumPreferencesParser.cs` | `array<{browser, sid, user_profile, …28 fields}>` |
+| `host.ide_extensions_installed()` **(deviation #25)** | VS Code-family (VSCode, Insiders, Cursor, Windsurf, VSCodium, Antigravity); `extensions.json` registry + `package.json` + `package.nls*.json` NLS resolution; mirrors `IdeExtensionsInstalled.cs` | `array<{ide, sid, user_profile, …18 fields}>` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and

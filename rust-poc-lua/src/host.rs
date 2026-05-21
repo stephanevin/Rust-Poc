@@ -15,7 +15,7 @@ use mlua::{
     AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value,
 };
 
-use super::{accounts, ad, gpo, net, regional, registry, tls, winver, wmi::Wmi, wnf, wts};
+use super::{accounts, ad, gpo, net, regional, registry, software, tls, winver, wmi::Wmi, wnf, wts};
 
 /// Per-run mutable state passed into binding closures. Lua is !Send, so
 /// this lives on the blocking thread that owns the Lua VM.
@@ -97,6 +97,7 @@ pub(super) fn install(
     install_tls_bindings(lua, &host, &state)?;
     install_regional_bindings(lua, &host, &state)?;
     install_accounts_bindings(lua, &host, &state)?;
+    install_software_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -657,6 +658,70 @@ fn install_accounts_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
             })?,
         )?;
     }
+
+    Ok(())
+}
+
+fn install_software_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.os_software_installed() — HKLM Uninstall registry + WTS per-user.
+    // Mirrors OSSoftwareInstalled.cs + OperatingSystem.GetSoftwareInstalled().
+    // Returns machine-level software even when WTS fails; the WTS error is
+    // recorded in host.errors() under "os_software_installed:wts".
+    {
+        let s = state.clone();
+        host.set(
+            "os_software_installed",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                let (rows, wts_err) = software::os_software_installed();
+                if let Some(e) = wts_err {
+                    st.record_error("os_software_installed:wts", e);
+                }
+                lua.to_value(&serde_json::Value::Array(rows))
+            })?,
+        )?;
+    }
+
+    // host.os_services() — Win32 Service Control Manager APIs.
+    // Mirrors OSServices.cs + OperatingSystem.GetOSServices().
+    {
+        let s = state.clone();
+        host.set(
+            "os_services",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match software::os_services() {
+                    Ok(rows) => lua.to_value(&serde_json::Value::Array(rows)),
+                    Err(e) => {
+                        st.record_error("os_services", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.browser_extensions_installed() — Chromium Preferences + manifests.
+    // Mirrors BrowserExtensionsInstalled.cs + General.GetBrowserExtension().
+    host.set(
+        "browser_extensions_installed",
+        lua.create_function(|lua, ()| {
+            lua.to_value(&serde_json::Value::Array(
+                software::browser_extensions_installed(),
+            ))
+        })?,
+    )?;
+
+    // host.ide_extensions_installed() — extensions.json + package.json.
+    // Mirrors IdeExtensionsInstalled.cs + General.GetIdeExtensions().
+    host.set(
+        "ide_extensions_installed",
+        lua.create_function(|lua, ()| {
+            lua.to_value(&serde_json::Value::Array(
+                software::ide_extensions_installed(),
+            ))
+        })?,
+    )?;
 
     Ok(())
 }

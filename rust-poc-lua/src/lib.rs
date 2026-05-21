@@ -1,4 +1,4 @@
-//! In-process Lua 5.4 collector runtime + 41 `host.*` bindings.
+//! In-process Lua 5.4 collector runtime + 45 `host.*` bindings.
 //!
 //! This crate is **Windows-only** (real impl). On every other target
 //! (Linux dev/CI, macOS until macOS host bindings exist) it compiles to
@@ -86,6 +86,12 @@ mod regional;
 // level 2).  Deviations #19–#21.
 #[cfg(windows)]
 mod accounts;
+// `software` exposes host bindings for the Software sub-category of ComplianceApp:
+// installed software (registry Uninstall + WTS per-user), Windows services
+// (Win32 SC APIs), browser extensions (Chromium prefs + manifests), and IDE
+// extensions (VS Code-family extensions.json + package.json). Deviations #22–#25.
+#[cfg(windows)]
+mod software;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

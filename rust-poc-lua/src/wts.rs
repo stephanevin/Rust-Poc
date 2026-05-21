@@ -147,6 +147,65 @@ fn resolve_sid(account: &str) -> Option<String> {
     result
 }
 
+/// Returns `(sid, nt_account)` pairs for all **Active** sessions whose SID
+/// belongs to a domain account (`S-1-5-21-*`).
+///
+/// `nt_account` is the `"DOMAIN\\User"` string assembled directly from the WTS
+/// query — no extra `LookupAccountSidW` round-trip required.
+///
+/// Used by `software::os_software_installed` to enumerate per-user registry
+/// hives without the snapshot/persistence layer that `ComplianceApp` adds.
+///
+/// # Errors
+///
+/// Returns a descriptive `String` when `WTSEnumerateSessionsW` fails. An empty
+/// `Vec` (not an error) means the API succeeded but no matching session is
+/// currently active.
+pub(crate) fn active_domain_sessions() -> Result<Vec<(String, String)>, String> {
+    let mut p_sessions: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+    let mut count: u32 = 0;
+
+    // SAFETY: hServer = None → local server. p_sessions receives an array
+    // allocated by WTSAPI; released with WTSFreeMemory below.
+    unsafe { WTSEnumerateSessionsW(None, 0, 1, &mut p_sessions, &mut count) }
+        .map_err(|e| format!("WTSEnumerateSessionsW failed: {e}"))?;
+
+    let mut sessions = Vec::new();
+
+    for i in 0..count {
+        // SAFETY: contiguous array of `count` elements; index is in bounds.
+        let info = unsafe { &*p_sessions.add(i as usize) };
+
+        // Only consider Active sessions (state == 0 = WTSActive).
+        if info.State.0 != 0 {
+            continue;
+        }
+
+        let Some(user) = query_session_string(info.SessionId, WTS_USER_NAME) else {
+            continue;
+        };
+        if user.is_empty() {
+            continue;
+        }
+
+        let account = match query_session_string(info.SessionId, WTS_DOMAIN_NAME) {
+            Some(d) if !d.is_empty() => format!("{d}\\{user}"),
+            _ => user,
+        };
+
+        if let Some(sid) = resolve_sid(&account)
+            && sid.starts_with("S-1-5-21-")
+        {
+            sessions.push((sid, account));
+        }
+    }
+
+    // SAFETY: allocated by WTSEnumerateSessionsW; WTSFreeMemory is correct.
+    unsafe { WTSFreeMemory(p_sessions.cast()) };
+
+    Ok(sessions)
+}
+
 /// Returns all WTS sessions on the local machine as a JSON array.
 ///
 /// An empty `Vec` (not an error) is returned when enumeration succeeds but
