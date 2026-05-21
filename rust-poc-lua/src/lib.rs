@@ -1,4 +1,4 @@
-//! In-process Lua 5.4 collector runtime + 25 `host.*` bindings.
+//! In-process Lua 5.4 collector runtime + 28 `host.*` bindings.
 //!
 //! This crate is **Windows-only** (real impl). On every other target
 //! (Linux dev/CI, macOS until macOS host bindings exist) it compiles to
@@ -55,6 +55,11 @@ mod sandbox;
 mod winver;
 #[cfg(windows)]
 mod wmi;
+// `wts` exposes `host.terminal_sessions()` via WTSEnumerateSessionsW +
+// WTSQuerySessionInformationW — mirrors TerminalSessionService from
+// ComplianceApp/components.
+#[cfg(windows)]
+mod wts;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

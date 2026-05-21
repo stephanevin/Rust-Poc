@@ -74,7 +74,7 @@ structure of `sdh-fleet-client`:
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 20 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 29 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
 | **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
@@ -218,7 +218,7 @@ rust-poc-lua/src/
 ├── lib.rs          # Public API + non-Windows stub
 ├── runtime.rs      # InternalRuntime::run — async, tokio::spawn_blocking + timeout
 ├── sandbox.rs      # Strips io/dofile/require/etc. globals
-├── host.rs         # 23 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── host.rs         # 29 `host.*` bindings + HostState (Rc<RefCell<..>>)
 ├── wmi.rs          # COMLibrary + WMIConnection + per-class cache
 ├── registry.rs     # RegOpenKeyExW + RegQueryValueExW + REG_* decode
 ├── net.rs          # GetAdaptersAddresses + IPv4 enumeration
@@ -229,7 +229,7 @@ rust-poc-lua/src/
 └── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 27 `host.*` bindings exposed to Lua
+### The 29 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -259,6 +259,8 @@ rust-poc-lua/src/
 | `host.desktop_resolution()` | WMI `Win32_VideoController.{Current*Resolution, RefreshRate}` | `string?` |
 | `host.chassis_type()` **(deviation #8)** | WMI `Win32_SystemEnclosure.ChassisTypes[0]` → SMBIOS code + label | `{code: number, label: string}?` |
 | `host.virtual_machine()` **(deviation #8)** | CPUID leaf 1 ECX bit 31 (`std::arch::x86_64::__cpuid`) | `bool` |
+| `host.terminal_sessions()` **(deviation #9)** | WTS `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW` + `LookupAccountNameW` | `array<{session_id, station_name, state, user, sid}>?` |
+| `host.os_last_boot_up_time()` | `NtQuerySystemInformation(SystemTimeOfDayInformation).BootTime` → ISO 8601 UTC | `string?` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -335,7 +337,7 @@ re-sync is mechanical.
 
 6. **`rust-poc-lua/src/hostname.rs` + `install_hostname_bindings` in
    `host.rs` — three additional hostname bindings.**
-   Upstream exposes 17 `host.*` bindings; this PoC exposes 24. The
+   Upstream exposes 17 `host.*` bindings; this PoC exposes 29. The
    three extra bindings all call `GetComputerNameExW` with a different
    `COMPUTER_NAME_FORMAT` constant (non-`Physical*` variants — parité
    avec `IPGlobalProperties.HostName` de .NET, voir ci-dessous) :

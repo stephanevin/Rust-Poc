@@ -84,6 +84,10 @@ function collect()
     machine_name             = host.netbios_name(),
     host_name                = host.host_name(),
     fqdn                     = host.fqdn(),
+    -- WTS sessions via WTSEnumerateSessionsW + WTSQuerySessionInformationW.
+    -- Each entry: { session_id, station_name, state, user, sid }.
+    -- Mirrors DataService.GetTerminalSessions() from ComplianceApp.
+    terminal_sessions        = host.terminal_sessions(),
 
     -- Active Directory — computer object (nil on non-domain-joined machines).
     -- Tier-1: GetComputerObjectNameW / DsGetSiteNameW (Netlogon local cache).
@@ -122,7 +126,8 @@ function collect()
 
     -- Operating System
     os_product                = os_product_name(ver),
-    os_sku                    = ver and ver.build or nil,
+    -- Win32 GetProductInfo() — Enterprise = 4, Professional = 48 (PRODUCT_* in winnt.h).
+    os_sku                    = host.os_sku(),
     os_caption                = host.wmi_query("Win32_OperatingSystem", "Caption"),
     os_display_version        = host.registry_read(
       "HKLM",
@@ -130,6 +135,10 @@ function collect()
       "DisplayVersion"
     ),
     os_version                = os_version_str,
+    -- NtQuerySystemInformation(SystemTimeOfDayInformation).BootTime → ISO 8601 UTC.
+    -- Mirrors DataService.GetOSLastBootUpTime() from ComplianceApp (WMI Win32_OperatingSystem.LastBootUpTime).
+    -- Unlike GetTickCount64, this includes time spent in sleep/hibernation.
+    os_last_boot_up_time      = host.os_last_boot_up_time(),
     os_install_date           = setup.install_date,
     os_setup_snapshot_history = setup.history or {},
     os_file_rename_pending    = pending_count > 0,

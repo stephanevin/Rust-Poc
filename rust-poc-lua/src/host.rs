@@ -15,7 +15,7 @@ use mlua::{
     AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value,
 };
 
-use super::{ad, net, registry, winver, wmi::Wmi};
+use super::{ad, net, registry, winver, wmi::Wmi, wts};
 
 /// Per-run mutable state passed into binding closures. Lua is !Send, so
 /// this lives on the blocking thread that owns the Lua VM.
@@ -86,7 +86,7 @@ pub(super) fn install(
     install_scalars(lua, &host, &state)?;
     install_wmi_bindings(lua, &host, &state)?;
     install_registry_bindings(lua, &host, &state)?;
-    install_winver_bindings(lua, &host)?;
+    install_winver_bindings(lua, &host, &state)?;
     install_net_bindings(lua, &host, &state)?;
     install_hostname_bindings(lua, &host, &state)?;
     install_ad_bindings(lua, &host, &state)?;
@@ -212,7 +212,7 @@ fn install_registry_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
 
 // --- Windows version --------------------------------------------------
 
-fn install_winver_bindings(lua: &Lua, host: &Table) -> LuaResult<()> {
+fn install_winver_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
     host.set(
         "rtl_get_version",
         lua.create_function(|lua, ()| lua.to_value(&winver::rtl_get_version()))?,
@@ -222,6 +222,30 @@ fn install_winver_bindings(lua: &Lua, host: &Table) -> LuaResult<()> {
         "get_firmware_type",
         lua.create_function(|_, ()| Ok(winver::firmware_type().map(str::to_string)))?,
     )?;
+
+    host.set(
+        "os_sku",
+        lua.create_function(|_, ()| Ok(winver::product_sku()))?,
+    )?;
+
+    {
+        let s = state.clone();
+        host.set(
+            "os_last_boot_up_time",
+            lua.create_function(move |_, ()| {
+                if let Some(ts) = winver::last_boot_up_time() {
+                    Ok(Some(ts))
+                } else {
+                    s.borrow_mut().record_error(
+                        "os_last_boot_up_time",
+                        "NtQuerySystemInformation(SystemTimeOfDayInformation) returned no value"
+                            .to_string(),
+                    );
+                    Ok(None)
+                }
+            })?,
+        )?;
+    }
 
     Ok(())
 }
@@ -355,6 +379,7 @@ fn install_composites(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()>
     bind_desktop_resolution(lua, host, state)?;
     bind_chassis_type(lua, host, state)?;
     bind_virtual_machine(lua, host, state)?;
+    bind_terminal_sessions(lua, host, state)?;
     Ok(())
 }
 
@@ -730,6 +755,39 @@ fn detect_virtual_machine(st: &mut HostState) -> bool {
     }
 
     false
+}
+
+/// Exposes `host.terminal_sessions()` → `array<{session_id, station_name, state, user, sid}> | nil`.
+///
+/// Lists all WTS sessions on the local machine via `WTSEnumerateSessionsW` +
+/// `WTSQuerySessionInformationW` — the same Win32 path taken by
+/// `TerminalSessionService` in `ComplianceApp`'s `components` library.
+///
+/// Each element mirrors `TerminalSessionDto` from `ComplianceApp`:
+/// - `session_id`   — `u32` (e.g. `1`)
+/// - `station_name` — station name string (e.g. `"Console"`, `"RDP-Tcp#0"`)
+/// - `state`        — `WTS_CONNECTSTATE_CLASS` as string (e.g. `"Active"`, `"Disconnected"`)
+/// - `user`         — `"DOMAIN\User"` or `null` when no user is associated
+/// - `sid`          — SID string (`"S-1-5-…"`) via `LookupAccountNameW`, or `null`
+///
+/// Returns `nil` and records an error when `WTSEnumerateSessionsW` fails.
+/// Returns an empty array (not `nil`) when enumeration succeeds but the
+/// machine reports no sessions.
+fn bind_terminal_sessions(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        "terminal_sessions",
+        lua.create_function(move |lua, ()| {
+            let mut st = s.borrow_mut();
+            match wts::sessions() {
+                Ok(rows) => lua.to_value(&serde_json::Value::Array(rows)),
+                Err(e) => {
+                    st.record_error("terminal_sessions", e);
+                    Ok(Value::Nil)
+                }
+            }
+        })?,
+    )
 }
 
 // --- errors() ---------------------------------------------------------
