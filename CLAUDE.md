@@ -74,7 +74,7 @@ structure of `sdh-fleet-client`:
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 29 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 33 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
 | **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
@@ -218,7 +218,7 @@ rust-poc-lua/src/
 ├── lib.rs          # Public API + non-Windows stub
 ├── runtime.rs      # InternalRuntime::run — async, tokio::spawn_blocking + timeout
 ├── sandbox.rs      # Strips io/dofile/require/etc. globals
-├── host.rs         # 29 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── host.rs         # 33 `host.*` bindings + HostState (Rc<RefCell<..>>)
 ├── wmi.rs          # COMLibrary + WMIConnection + per-class cache
 ├── registry.rs     # RegOpenKeyExW + RegQueryValueExW + REG_* decode
 ├── net.rs          # GetAdaptersAddresses + IPv4 enumeration
@@ -229,7 +229,7 @@ rust-poc-lua/src/
 └── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 29 `host.*` bindings exposed to Lua
+### The 33 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -261,6 +261,10 @@ rust-poc-lua/src/
 | `host.virtual_machine()` **(deviation #8)** | CPUID leaf 1 ECX bit 31 (`std::arch::x86_64::__cpuid`) | `bool` |
 | `host.terminal_sessions()` **(deviation #9)** | WTS `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW` + `LookupAccountNameW` | `array<{session_id, station_name, state, user, sid}>?` |
 | `host.os_last_boot_up_time()` | `NtQuerySystemInformation(SystemTimeOfDayInformation).BootTime` → ISO 8601 UTC | `string?` |
+| `host.uso_reboot_required()` **(deviation #10)** | `NtQueryWnfStateData(WNF_USO_REBOOT_REQUIRED)` via [`wnf`](https://docs.rs/wnf) crate — DWORD > 0 → true | `bool?` |
+| `host.ad_computer_gpos()` **(deviation #11)** | Registry `Group Policy\State\Machine\GPO-List` + `GPLink-List` — mirrors `AdComputerGpos.cs` | `array<{context, link_order, gpo_name, gpo_id, filtering, scope_of_management, revision}>?` |
+| `host.ad_user_gpos()` **(deviation #12)** | Registry `Group Policy\State\{SID}\GPO-List` (all non-Machine contexts) — mirrors `AdUserGpos.cs` | `array<{context, link_order, gpo_name, gpo_id, filtering, scope_of_management, revision, is_loopback}>?` |
+| `host.gp_extensions_status()` **(deviation #13)** | Registry `Group Policy\State\Machine\Extension-List` + `Group Policy\Status\GPExtensions` — mirrors `GpExtensionsStatus.cs` | `array<{id, name, status, last_policy_time}>?` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and

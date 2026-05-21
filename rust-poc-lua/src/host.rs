@@ -15,7 +15,7 @@ use mlua::{
     AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value,
 };
 
-use super::{ad, net, registry, winver, wmi::Wmi, wts};
+use super::{ad, gpo, net, registry, winver, wmi::Wmi, wnf, wts};
 
 /// Per-run mutable state passed into binding closures. Lua is !Send, so
 /// this lives on the blocking thread that owns the Lua VM.
@@ -92,6 +92,8 @@ pub(super) fn install(
     install_ad_bindings(lua, &host, &state)?;
     install_ad_computer_bindings(lua, &host, &state)?;
     install_setup_history(lua, &host)?;
+    install_wnf_bindings(lua, &host, &state)?;
+    install_gpo_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -364,6 +366,91 @@ fn install_setup_history(lua: &Lua, host: &Table) -> LuaResult<()> {
         "setup_history",
         lua.create_function(|lua, ()| lua.to_value(&super::eventlog::install_info()))?,
     )?;
+
+    Ok(())
+}
+
+// --- Windows Notification Facility (WNF) --------------------------------
+
+fn install_wnf_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        "uso_reboot_required",
+        lua.create_function(move |_, ()| {
+            if let Some(v) = wnf::uso_reboot_required() {
+                Ok(Some(v))
+            } else {
+                s.borrow_mut().record_error(
+                    "uso_reboot_required",
+                    "WNF_USO_REBOOT_REQUIRED state could not be read".to_string(),
+                );
+                Ok(None)
+            }
+        })?,
+    )?;
+
+    Ok(())
+}
+
+// --- Group Policy (GPO) ------------------------------------------------
+
+fn install_gpo_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.ad_computer_gpos()
+    {
+        let s = state.clone();
+        host.set(
+            "ad_computer_gpos",
+            lua.create_function(move |lua, ()| {
+                if let Some(rows) = gpo::computer_gpos() {
+                    lua.to_value(&serde_json::Value::Array(rows))
+                } else {
+                    s.borrow_mut().record_error(
+                        "ad_computer_gpos",
+                        "No Machine GPOs found in Group Policy State registry (GP not applied or machine not domain-joined)".to_string(),
+                    );
+                    Ok(mlua::Value::Nil)
+                }
+            })?,
+        )?;
+    }
+
+    // host.ad_user_gpos()
+    {
+        let s = state.clone();
+        host.set(
+            "ad_user_gpos",
+            lua.create_function(move |lua, ()| {
+                if let Some(rows) = gpo::user_gpos() {
+                    lua.to_value(&serde_json::Value::Array(rows))
+                } else {
+                    s.borrow_mut().record_error(
+                        "ad_user_gpos",
+                        "Group Policy State registry key absent (GP never applied on this machine)".to_string(),
+                    );
+                    Ok(mlua::Value::Nil)
+                }
+            })?,
+        )?;
+    }
+
+    // host.gp_extensions_status()
+    {
+        let s = state.clone();
+        host.set(
+            "gp_extensions_status",
+            lua.create_function(move |lua, ()| {
+                if let Some(rows) = gpo::gp_extensions_status() {
+                    lua.to_value(&serde_json::Value::Array(rows))
+                } else {
+                    s.borrow_mut().record_error(
+                        "gp_extensions_status",
+                        "Core GP extension key absent (GP never applied on this machine)".to_string(),
+                    );
+                    Ok(mlua::Value::Nil)
+                }
+            })?,
+        )?;
+    }
 
     Ok(())
 }

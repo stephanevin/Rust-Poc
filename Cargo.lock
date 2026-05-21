@@ -380,6 +380,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
+name = "num-derive"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -522,6 +533,7 @@ dependencies = [
  "tracing",
  "windows",
  "wmi",
+ "wnf",
 ]
 
 [[package]]
@@ -726,6 +738,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -1011,6 +1024,19 @@ dependencies = [
  "thiserror",
  "windows",
  "windows-core",
+]
+
+[[package]]
+name = "wnf"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50c0f9a6c59e22ff59984f0fbe11ca05e9c3acba2016a7520a9957438bc3cc2c"
+dependencies = [
+ "num-derive",
+ "num-traits",
+ "thiserror",
+ "tracing",
+ "windows",
 ]
 
 [[package]]

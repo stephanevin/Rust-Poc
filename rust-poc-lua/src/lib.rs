@@ -60,6 +60,17 @@ mod wmi;
 // ComplianceApp/components.
 #[cfg(windows)]
 mod wts;
+// `well_known_wnf_name` mirrors WellKnownWnfName.cs (Windows 24H2).
+// Catalogue of 1 497 WNF state-name constants; consumed by `wnf`.
+#[cfg(windows)]
+mod well_known_wnf_name;
+// `wnf` exposes host bindings backed by the Windows Notification Facility.
+#[cfg(windows)]
+mod wnf;
+// `gpo` exposes host bindings for Group Policy Object lists and GP extension
+// status, reading from the Group Policy registry State / Status hives.
+#[cfg(windows)]
+mod gpo;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

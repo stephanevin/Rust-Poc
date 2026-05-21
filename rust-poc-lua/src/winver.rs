@@ -114,7 +114,7 @@ pub(super) fn product_sku() -> Option<u32> {
 /// No external crate dependency: the calendar arithmetic is from the
 /// [Howard Hinnant civil-from-days algorithm](https://howardhinnant.github.io/date_algorithms.html#civil_from_days),
 /// which is exact for the proleptic Gregorian calendar.
-fn filetime_to_iso8601(ticks: i64) -> Option<String> {
+pub(crate) fn filetime_to_iso8601(ticks: i64) -> Option<String> {
     // 100-ns ticks between 1601-01-01 (FILETIME epoch) and 1970-01-01 (Unix).
     const EPOCH_DIFF: i64 = 116_444_736_000_000_000;
     if ticks <= 0 {

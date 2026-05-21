@@ -139,6 +139,18 @@ function collect()
     -- Mirrors DataService.GetOSLastBootUpTime() from ComplianceApp (WMI Win32_OperatingSystem.LastBootUpTime).
     -- Unlike GetTickCount64, this includes time spent in sleep/hibernation.
     os_last_boot_up_time      = host.os_last_boot_up_time(),
+    -- NtQueryWnfStateData(WNF_USO_REBOOT_REQUIRED) → true when USO has flagged a reboot.
+    -- Mirrors DataService.GetUsoRebootRequired() from ComplianceApp.
+    uso_reboot_required       = host.uso_reboot_required(),
+    -- Group Policy\State registry — applied GPOs for the Machine context.
+    -- Mirrors AdComputerGpos.cs / DataService.GetGpoList("Machine").
+    ad_computer_gpos          = host.ad_computer_gpos(),
+    -- Group Policy\State registry — applied GPOs for all user contexts (AllUsers mode).
+    -- Mirrors AdUserGpos.cs / DataService.GetGpoList("AllUsers").
+    ad_user_gpos              = host.ad_user_gpos(),
+    -- Group Policy\Status\GPExtensions + Group Policy\State\Machine\Extension-List.
+    -- Mirrors GpExtensionsStatus.cs / DataService.GetGpExtensionsStatus().
+    gp_extensions_status      = host.gp_extensions_status(),
     os_install_date           = setup.install_date,
     os_setup_snapshot_history = setup.history or {},
     os_file_rename_pending    = pending_count > 0,
