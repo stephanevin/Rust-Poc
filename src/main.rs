@@ -92,7 +92,32 @@ async fn main() -> ExitCode {
     let script_arg = args.get(1).cloned();
     let perimeter = args.get(2).map(String::as_str);
 
-    let cache_dir = PathBuf::from("collectors");
+    // Locate the collectors directory with a two-step probe so that both
+    // the development workflow (`cargo run` from the workspace root) and
+    // the installed deployment (`C:\Program Files\Sanofi\CollectConfig\`)
+    // work without any special configuration:
+    //
+    //   Step 1 — CWD-relative:  `./collectors/`
+    //     Works for `cargo run` (CWD = workspace root where collectors/ lives)
+    //     and for any operator who launches the binary from its install dir.
+    //
+    //   Step 2 — binary-relative: `<exe dir>/collectors/`
+    //     Works for the Inno Setup deployment where the installer places
+    //     collectors\ next to collect-config.exe and a scheduled task /
+    //     SCCM launch sets CWD to something unrelated (e.g. System32).
+    //
+    // Rust concept: `std::env::current_exe()` gives the absolute path of
+    // the running binary regardless of CWD — the idiomatic equivalent of
+    // `AppDomain.CurrentDomain.BaseDirectory` in C#.
+    let cwd_relative = PathBuf::from("collectors");
+    let cache_dir = if cwd_relative.is_dir() {
+        cwd_relative
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.join("collectors")))
+            .unwrap_or_else(|| PathBuf::from("collectors"))
+    };
 
     // `hostname::get` is the cross-platform way to read the machine
     // name (GetComputerNameW on Windows, gethostname() on Unix). The
