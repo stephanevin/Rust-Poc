@@ -85,8 +85,16 @@ pub fn init() -> (WorkerGuard, PathBuf) {
         .json()
         .with_writer(non_blocking);
 
+    // ANSI colour codes are off by design: the binary is deployed via
+    // Inno Setup and invoked from cmd.exe / scheduled tasks / SCCM, where
+    // `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is not propagated to child
+    // processes and the escape sequences (`←[2m`, `←[32m`, …) would
+    // appear as literal garbage. The compact format remains very readable
+    // without colour. JSON file output is unaffected (json layer is
+    // structured, never ANSI).
     let console_layer = tracing_subscriber::fmt::layer()
         .compact()
+        .with_ansi(false)
         .with_writer(std::io::stderr);
 
     let env_filter = EnvFilter::builder()
