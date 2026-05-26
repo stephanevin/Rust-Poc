@@ -44,6 +44,7 @@ windows = { version = "0.62", features = [
     "Win32_Globalization",                        # GetUser/SystemDefaultUILanguage, GetUser/SystemDefaultLocaleName, LCIDToLocaleName
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",                  # OpenSCManagerW, EnumServicesStatusExW, SC_HANDLE
+    "Win32_System_UpdateAgent",               # WUA COM: IUpdateSession3, IUpdateSearcher3, ISystemInformation, IUpdateInstaller, IUpdateServiceManager2, IAutomaticUpdates2
     "Wdk",
     "Wdk_System",
     "Wdk_System_SystemInformation",

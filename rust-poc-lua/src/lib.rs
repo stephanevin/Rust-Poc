@@ -1,4 +1,4 @@
-//! In-process Lua 5.4 collector runtime + 45 `host.*` bindings.
+//! In-process Lua 5.4 collector runtime + 51 `host.*` bindings.
 //!
 //! This crate is **Windows-only** (real impl). On every other target
 //! (Linux dev/CI, macOS until macOS host bindings exist) it compiles to
@@ -92,6 +92,12 @@ mod accounts;
 // extensions (VS Code-family extensions.json + package.json). Deviations #22–#25.
 #[cfg(windows)]
 mod software;
+// `updates` exposes host bindings for the System Updates sub-category of
+// ComplianceApp using WUA COM interfaces directly (IUpdateServiceManager2,
+// ISystemInformation, IUpdateInstaller, IUpdateSession3) and WMI Root\ccm
+// for SCCM-targeted updates. Deviations #26–#31.
+#[cfg(windows)]
+mod updates;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

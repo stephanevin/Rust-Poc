@@ -84,7 +84,6 @@ impl Drop for NetBuf {
     }
 }
 
-
 // --- Internal helpers ----------------------------------------------------
 
 /// Helper: reads a DWORD registry value and returns it as `u32`.
@@ -296,7 +295,9 @@ fn expand_env_vars(s: &str) -> String {
     for _ in 0..16 {
         let Some(start) = result.find('%') else { break };
         let after = &result[start + 1..];
-        let Some(rel_end) = after.find('%') else { break };
+        let Some(rel_end) = after.find('%') else {
+            break;
+        };
         let var_name = &after[..rel_end];
         if var_name.is_empty() {
             break;
@@ -316,15 +317,24 @@ fn expand_env_vars(s: &str) -> String {
 /// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`
 /// as `(sid, nt_account, profile_image_path)` tuples.
 ///
-/// Filters out well-known system SIDs (`S-1-5-18/19/20`) and entries without
-/// a `ProfileImagePath`.  This is the minimal profile data consumed by
-/// `software::browser_extensions_installed` and `software::ide_extensions_installed`.
+/// Filters out well-known system SIDs (`S-1-5-18/19/20`) and entries
+/// without a `ProfileImagePath`.  This is the minimal profile data
+/// consumed by `software::browser_extensions_installed` and
+/// `software::ide_extensions_installed`.
 ///
-/// Returns an empty `Vec` when the key is absent.
-pub(crate) fn profile_list() -> Vec<(String, String, std::path::PathBuf)> {
+/// The return shape distinguishes:
+/// - `Ok(vec![])`  — the key exists with zero domain profiles **or** the
+///   key is absent (fresh container image without an interactive logon).
+///   Both outcomes look identical to operators and are not actionable.
+/// - `Ok(vec![..])` — at least one profile was enumerated.
+/// - `Err(_)`      — `RegOpenKeyExW` failed for any reason other than
+///   absence (access denied, registry corruption, …).  The error message
+///   embeds the Win32 status code; callers record it so an empty
+///   extension list doesn't silently mask a real failure.
+pub(crate) fn try_profile_list() -> Result<Vec<(String, String, std::path::PathBuf)>, String> {
     const PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
 
-    let sids = super::registry::subkey_names("HKLM", PROFILE_LIST);
+    let sids = super::registry::try_subkey_names("HKLM", PROFILE_LIST)?;
     let mut result = Vec::with_capacity(sids.len());
 
     for sid in &sids {
@@ -340,7 +350,7 @@ pub(crate) fn profile_list() -> Vec<(String, String, std::path::PathBuf)> {
         result.push((sid.clone(), nt_account, std::path::PathBuf::from(expanded)));
     }
 
-    result
+    Ok(result)
 }
 
 // --- Public bindings -----------------------------------------------------
@@ -358,19 +368,30 @@ pub(crate) fn profile_list() -> Vec<(String, String, std::path::PathBuf)> {
 /// System accounts (`S-1-5-18`, `S-1-5-19`, `S-1-5-20`) and entries without
 /// a `ProfileImagePath` are silently excluded — same filter as `UserProfiles.cs`.
 ///
-/// Returns an empty `Vec` when the key is absent (e.g. fresh container image).
+/// Returns `(rows, None)` for both healthy machines and the (rare) case
+/// where the `ProfileList` key is absent — an empty profile list is a
+/// valid state, not an error.  Returns `(vec![], Some(message))` when
+/// `RegOpenKeyExW` failed for any other reason (access denied, registry
+/// corruption) — symmetric with `software::browser_extensions_installed`
+/// and `software::ide_extensions_installed`, which all share the same
+/// `try_profile_list`-style contract.  The caller records the diagnostic
+/// under `"user_profiles"` in `host.errors()`.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// let profiles = user_profiles();
-/// // [{"sid": "S-1-5-21-...", "nt_account": "DOMAIN\\Alice", ...}, ...]
+/// let (profiles, err) = user_profiles();
+/// // profiles: [{"sid": "S-1-5-21-...", "nt_account": "DOMAIN\\Alice", ...}, ...]
+/// // err:      None | Some("RegOpenKeyExW(HKLM\\…\\ProfileList) failed ...")
 /// ```
-#[must_use]
-pub(super) fn user_profiles() -> Vec<Value> {
+#[must_use = "caller must record the ProfileList diagnostic in host.errors()"]
+pub(super) fn user_profiles() -> (Vec<Value>, Option<String>) {
     const PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
 
-    let sids = super::registry::subkey_names("HKLM", PROFILE_LIST);
+    let sids = match super::registry::try_subkey_names("HKLM", PROFILE_LIST) {
+        Ok(v) => v,
+        Err(e) => return (Vec::new(), Some(e)),
+    };
     let mut result = Vec::with_capacity(sids.len());
 
     for sid in &sids {
@@ -402,7 +423,7 @@ pub(super) fn user_profiles() -> Vec<Value> {
         }));
     }
 
-    result
+    (result, None)
 }
 
 /// Returns local user accounts on the machine via `NetUserEnum(level=0)` +

@@ -15,7 +15,71 @@ use mlua::{
     AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value,
 };
 
-use super::{accounts, ad, gpo, net, regional, registry, software, tls, winver, wmi::Wmi, wnf, wts};
+use super::{
+    accounts, ad, gpo, net, regional, registry, software, tls, updates, winver, wmi::Wmi, wnf, wts,
+};
+
+/// Canonical `host.errors()` key for any failure of
+/// [`updates::build_offline_payload`].  Centralised here so both
+/// `updates_windows_updates` and `updates_sccm_updates` surface the
+/// same diagnostic regardless of which one triggered the init.
+const ERR_KEY_WUA_CACHE_INIT: &str = "updates:wua_cache_init";
+
+/// Canonical `host.errors()` key for any failure of
+/// [`updates::default_au_service`].  Symmetric to
+/// [`ERR_KEY_WUA_CACHE_INIT`]: both `updates_is_managed` and
+/// `updates_managed_by` surface the same diagnostic regardless of which
+/// one triggered the init.
+const ERR_KEY_AU_SERVICE: &str = "updates:au_service";
+
+/// Tri-state cache for the shared WUA offline payload.
+///
+/// `Option<UpdatesCache>` would only distinguish "not initialised" from
+/// "initialised", so any binding hitting an init failure would silently
+/// retry the expensive `build_offline_payload()` on the next call.  The
+/// `Failed` variant memoises that the first attempt failed and short-
+/// circuits subsequent calls — see `HostState::ensure_updates_cache`.
+pub(super) enum UpdatesCacheState {
+    NotInit,
+    Ready(updates::UpdatesCache),
+    Failed,
+}
+
+impl UpdatesCacheState {
+    /// Returns the payload only in the [`Ready`](Self::Ready) state.
+    ///
+    /// Both [`NotInit`](Self::NotInit) and [`Failed`](Self::Failed) map
+    /// to `None`.  The method itself is infallible and side-effect free
+    /// — it does **not** trigger initialisation; call
+    /// [`HostState::ensure_updates_cache`] to transition out of
+    /// `NotInit`.
+    fn ready(&self) -> Option<&updates::UpdatesCache> {
+        match self {
+            Self::Ready(c) => Some(c),
+            Self::NotInit | Self::Failed => None,
+        }
+    }
+}
+
+/// Tri-state cache for the default WUA Automatic Updates service lookup.
+///
+/// Structurally identical to [`UpdatesCacheState`] (see its doc for the
+/// full rationale): the previous `Option<Option<(bool, String)>>` shape
+/// could only distinguish "not initialised" from "initialised", so a
+/// failed [`updates::default_au_service`] call was retried on every
+/// subsequent binding hit and could record one error key per binding.
+/// The [`Failed`](Self::Failed) variant memoises that the first attempt
+/// failed and short-circuits all later calls — see
+/// [`HostState::ensure_au_service`].
+///
+/// The inner `Option<(bool, String)>` of [`Ready`](Self::Ready) carries
+/// its own meaning: `None` is the valid "no service reported
+/// `IsDefaultAUService`" outcome, distinct from an init failure.
+pub(super) enum AuServiceState {
+    NotInit,
+    Ready(Option<(bool, String)>),
+    Failed,
+}
 
 /// Per-run mutable state passed into binding closures. Lua is !Send, so
 /// this lives on the blocking thread that owns the Lua VM.
@@ -24,6 +88,19 @@ pub(super) struct HostState {
     pub client_version: String,
     pub perimeter: Option<String>,
     pub wmi: Option<Wmi>,
+    /// One-shot cache of the WUA offline payload, populated lazily on the
+    /// first `host.updates_windows_updates()` or `host.updates_sccm_updates()`
+    /// call.  Mirrors the `wmi: Option<Wmi>` pattern above — one offline
+    /// search instead of two, shared by both bindings.  Init failures are
+    /// memoised (`Failed`) so subsequent bindings short-circuit.
+    pub updates_cache: UpdatesCacheState,
+    /// Cache of the default Automatic Updates service lookup, populated
+    /// lazily on the first `host.updates_is_managed()` or
+    /// `host.updates_managed_by()` call.  Mirrors `updates_cache`: a
+    /// single enumeration shared by both bindings, with init failures
+    /// memoised in [`AuServiceState::Failed`] to avoid repeated COM
+    /// round-trips.
+    pub au_service: AuServiceState,
     pub errors: HashMap<String, String>,
 }
 
@@ -34,11 +111,38 @@ impl HostState {
             client_version,
             perimeter,
             wmi: None,
+            updates_cache: UpdatesCacheState::NotInit,
+            au_service: AuServiceState::NotInit,
             errors: HashMap::new(),
         }
     }
 
+    /// Records a binding failure in the in-memory error table consumed by
+    /// `host.errors()` (and surfaced to the Lua collector as `_errors`)
+    /// AND emits a `tracing::warn!` event so the same failure also ends
+    /// up in the rolling JSON log file under `RUST_POC_LOG_DIR`.
+    ///
+    /// Why both:
+    ///
+    /// * The `_errors` table in the JSON output is the contract for the
+    ///   downstream consumer (a collector that read `result._errors`
+    ///   parses individual binding failures).
+    /// * But that table sits inside a large JSON payload that ops teams
+    ///   rarely inspect when a run "succeeds" (exit code 0).  Without
+    ///   the `tracing::warn!`, a silent failure such as
+    ///   `updates_sccm_updates` returning `WBEM_E_ACCESS_DENIED` after a
+    ///   5 s DCOM negotiation looks identical to a successful "no SCCM
+    ///   on this host" run — same exit code, same shape, no log line.
+    ///   The `warn!` here closes that observability gap: every recorded
+    ///   error produces exactly one structured log line, regardless of
+    ///   whether the calling binding chooses to surface a partial value
+    ///   to Lua or returns `Nil`.
+    ///
+    /// `field` is treated as the structured `binding` field so log
+    /// aggregators can group by binding name without parsing the
+    /// message.
     fn record_error(&mut self, field: &str, reason: String) {
+        tracing::warn!(binding = %field, error = %reason, "binding failed");
         self.errors.insert(field.to_string(), reason);
     }
 
@@ -49,6 +153,77 @@ impl HostState {
         self.wmi
             .as_mut()
             .ok_or_else(|| "wmi: unreachable — initialized above".to_string())
+    }
+
+    /// Lazy-init accessor for the shared WUA offline payload.
+    ///
+    /// First call performs the expensive offline search and stores the
+    /// payload; subsequent calls hand out the cached value.  On failure,
+    /// the state moves to [`UpdatesCacheState::Failed`] (no retry) and a
+    /// single canonical diagnostic is recorded under
+    /// [`ERR_KEY_WUA_CACHE_INIT`] — both `updates_windows_updates` and
+    /// `updates_sccm_updates` surface the same key regardless of which
+    /// one triggered the init.  Returns `None` for both `NotInit` (post-
+    /// failure path: should never happen, we just transitioned to
+    /// `Failed`) and `Failed`.
+    fn ensure_updates_cache(&mut self) -> Option<&updates::UpdatesCache> {
+        if matches!(self.updates_cache, UpdatesCacheState::NotInit) {
+            match updates::build_offline_payload() {
+                Ok(c) => self.updates_cache = UpdatesCacheState::Ready(c),
+                Err(e) => {
+                    self.updates_cache = UpdatesCacheState::Failed;
+                    // Defensive first-wins guard: unreachable today
+                    // because `Failed` memoisation short-circuits any
+                    // second visit to this branch, but kept on purpose
+                    // — if the state machine ever grows a retry path,
+                    // this preserves the original diagnostic.  The
+                    // `contains_key(&str)` lookup uses HashMap's
+                    // `Borrow<str>` impl so the canonical key is only
+                    // allocated when actually inserted (no wasted
+                    // `String::from` on the no-op path).
+                    if !self.errors.contains_key(ERR_KEY_WUA_CACHE_INIT) {
+                        self.errors.insert(ERR_KEY_WUA_CACHE_INIT.to_string(), e);
+                    }
+                }
+            }
+        }
+        self.updates_cache.ready()
+    }
+
+    /// Lazy-init accessor for the default AU service.
+    ///
+    /// Mirrors [`Self::ensure_updates_cache`] one-for-one:
+    /// - first call performs the COM enumeration and caches the outcome;
+    /// - subsequent calls hand out the cached value;
+    /// - on failure the state moves to [`AuServiceState::Failed`] (no
+    ///   retry) and a single canonical diagnostic is recorded under
+    ///   [`ERR_KEY_AU_SERVICE`] — `updates_is_managed` and
+    ///   `updates_managed_by` then surface the same key regardless of
+    ///   which one triggered the init.
+    ///
+    /// Returns `Some(&(is_managed, name))` only when a default service was
+    /// found.  All three other outcomes (`NotInit` post-failure — should
+    /// not happen, `Ready(None)`, `Failed`) collapse to `None` because
+    /// the caller only needs to distinguish "data available" from "not";
+    /// the error path is already recorded.
+    fn ensure_au_service(&mut self) -> Option<&(bool, String)> {
+        if matches!(self.au_service, AuServiceState::NotInit) {
+            match updates::default_au_service() {
+                Ok(v) => self.au_service = AuServiceState::Ready(v),
+                Err(e) => {
+                    self.au_service = AuServiceState::Failed;
+                    // Defensive first-wins guard; see ensure_updates_cache
+                    // for the full rationale.
+                    if !self.errors.contains_key(ERR_KEY_AU_SERVICE) {
+                        self.errors.insert(ERR_KEY_AU_SERVICE.to_string(), e);
+                    }
+                }
+            }
+        }
+        match &self.au_service {
+            AuServiceState::Ready(Some(v)) => Some(v),
+            AuServiceState::Ready(None) | AuServiceState::NotInit | AuServiceState::Failed => None,
+        }
     }
 }
 
@@ -98,6 +273,7 @@ pub(super) fn install(
     install_regional_bindings(lua, &host, &state)?;
     install_accounts_bindings(lua, &host, &state)?;
     install_software_bindings(lua, &host, &state)?;
+    install_updates_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -612,13 +788,24 @@ fn install_regional_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
 fn install_accounts_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
     // host.user_profiles() — registry ProfileList + LookupAccountSidW.
     // Mirrors UserProfiles.cs from ComplianceApp DataTransformers/Accounts.
-    // Always returns an array (empty when ProfileList key is absent).
-    host.set(
-        "user_profiles",
-        lua.create_function(|lua, ()| {
-            lua.to_value(&serde_json::Value::Array(accounts::user_profiles()))
-        })?,
-    )?;
+    // Always returns an array (empty when ProfileList key is absent or
+    // open-failed); fundamental failures surface under "user_profiles"
+    // in host.errors() — symmetric with browser_extensions_installed /
+    // ide_extensions_installed (all three read the same HKLM ProfileList).
+    {
+        let s = state.clone();
+        host.set(
+            "user_profiles",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                let (rows, err) = accounts::user_profiles();
+                if let Some(e) = err {
+                    st.record_error("user_profiles", e);
+                }
+                lua.to_value(&serde_json::Value::Array(rows))
+            })?,
+        )?;
+    }
 
     // host.local_user_accounts() — NetUserEnum(0) + NetUserGetInfo(4).
     // Mirrors LocalAccountsUsers.cs.
@@ -662,28 +849,78 @@ fn install_accounts_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
     Ok(())
 }
 
+/// Serializes a `serde_json::Value` to a Lua value, falling back to
+/// `nil` and recording a `<binding>:serialize` diagnostic if the mlua
+/// conversion itself fails.
+///
+/// `lua.to_value` is normally infallible for `serde_json` shapes the
+/// crate produces, but in principle it can propagate an mlua error
+/// (allocator failure, unsupported value type, etc.).  Without this
+/// helper the error would unwind through `collect()` with no entry in
+/// `host.errors()`, violating the workspace contract documented in the
+/// header of `collectors/softwares.lua` ("a binding never raises a Lua
+/// error").  Used by every binding that emits an array via
+/// `serde_json::Value::Array`.
+///
+/// The helper is infallible by design — callers wrap the return value
+/// in `Ok(...)` at their `LuaResult<Value>` boundary.
+fn lua_to_value_or_nil(
+    lua: &Lua,
+    st: &mut HostState,
+    binding: &str,
+    value: &serde_json::Value,
+) -> Value {
+    match lua.to_value(value) {
+        Ok(v) => v,
+        Err(e) => {
+            st.record_error(&format!("{binding}:serialize"), e.to_string());
+            Value::Nil
+        }
+    }
+}
+
 fn install_software_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
     // host.os_software_installed() — HKLM Uninstall registry + WTS per-user.
     // Mirrors OSSoftwareInstalled.cs + OperatingSystem.GetSoftwareInstalled().
-    // Returns machine-level software even when WTS fails; the WTS error is
-    // recorded in host.errors() under "os_software_installed:wts".
+    // Best-effort: machine-level software comes through even when the WTS
+    // enumeration fails or when an HKLM uninstall hive cannot be opened.
+    // Failures are surfaced under distinct keys so the operator can tell
+    // which slice of the data is missing:
+    //   - "os_software_installed:wts"       → per-user entries absent
+    //   - "os_software_installed:registry"  → at least one HKLM Uninstall
+    //                                         hive failed to open (rare;
+    //                                         usually access denied)
+    //   - "os_software_installed:serialize" → mlua serialization failure
+    //                                         (theoretical safety net)
     {
         let s = state.clone();
         host.set(
             "os_software_installed",
             lua.create_function(move |lua, ()| {
                 let mut st = s.borrow_mut();
-                let (rows, wts_err) = software::os_software_installed();
+                let (rows, wts_err, registry_err) = software::os_software_installed();
                 if let Some(e) = wts_err {
                     st.record_error("os_software_installed:wts", e);
                 }
-                lua.to_value(&serde_json::Value::Array(rows))
+                if let Some(e) = registry_err {
+                    st.record_error("os_software_installed:registry", e);
+                }
+                let value = serde_json::Value::Array(rows);
+                Ok(lua_to_value_or_nil(
+                    lua,
+                    &mut st,
+                    "os_software_installed",
+                    &value,
+                ))
             })?,
         )?;
     }
 
     // host.os_services() — Win32 Service Control Manager APIs.
     // Mirrors OSServices.cs + OperatingSystem.GetOSServices().
+    // All-or-nothing on OpenSCManagerW failure (nil + "os_services").
+    // Per-service OpenServiceW failures emit a partial row and bump a
+    // counter surfaced under "os_services:partial".
     {
         let s = state.clone();
         host.set(
@@ -691,7 +928,19 @@ fn install_software_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
             lua.create_function(move |lua, ()| {
                 let mut st = s.borrow_mut();
                 match software::os_services() {
-                    Ok(rows) => lua.to_value(&serde_json::Value::Array(rows)),
+                    Ok((rows, partial_skips)) => {
+                        if partial_skips > 0 {
+                            st.record_error(
+                                "os_services:partial",
+                                format!(
+                                    "{partial_skips} service(s) had OpenServiceW failures \
+                                     (start_mode, path_name, start_name are null in those rows)"
+                                ),
+                            );
+                        }
+                        let value = serde_json::Value::Array(rows);
+                        Ok(lua_to_value_or_nil(lua, &mut st, "os_services", &value))
+                    }
                     Err(e) => {
                         st.record_error("os_services", e);
                         Ok(Value::Nil)
@@ -703,25 +952,205 @@ fn install_software_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
 
     // host.browser_extensions_installed() — Chromium Preferences + manifests.
     // Mirrors BrowserExtensionsInstalled.cs + General.GetBrowserExtension().
-    host.set(
-        "browser_extensions_installed",
-        lua.create_function(|lua, ()| {
-            lua.to_value(&serde_json::Value::Array(
-                software::browser_extensions_installed(),
-            ))
-        })?,
-    )?;
+    // Best-effort: per-profile / per-file failures are absorbed (a single
+    // unreadable manifest would otherwise produce a flood of error rows).
+    // Only a fundamental failure (HKLM ProfileList inaccessible) is
+    // surfaced under "browser_extensions_installed" in host.errors().
+    {
+        let s = state.clone();
+        host.set(
+            "browser_extensions_installed",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                let (rows, err) = software::browser_extensions_installed();
+                if let Some(e) = err {
+                    st.record_error("browser_extensions_installed", e);
+                }
+                let value = serde_json::Value::Array(rows);
+                Ok(lua_to_value_or_nil(
+                    lua,
+                    &mut st,
+                    "browser_extensions_installed",
+                    &value,
+                ))
+            })?,
+        )?;
+    }
 
     // host.ide_extensions_installed() — extensions.json + package.json.
     // Mirrors IdeExtensionsInstalled.cs + General.GetIdeExtensions().
-    host.set(
-        "ide_extensions_installed",
-        lua.create_function(|lua, ()| {
-            lua.to_value(&serde_json::Value::Array(
-                software::ide_extensions_installed(),
-            ))
-        })?,
-    )?;
+    // Same best-effort policy as browser_extensions_installed above.
+    {
+        let s = state.clone();
+        host.set(
+            "ide_extensions_installed",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                let (rows, err) = software::ide_extensions_installed();
+                if let Some(e) = err {
+                    st.record_error("ide_extensions_installed", e);
+                }
+                let value = serde_json::Value::Array(rows);
+                Ok(lua_to_value_or_nil(
+                    lua,
+                    &mut st,
+                    "ide_extensions_installed",
+                    &value,
+                ))
+            })?,
+        )?;
+    }
+
+    Ok(())
+}
+
+// --- System Updates (WUA COM) -----------------------------------------
+
+#[allow(clippy::too_many_lines)]
+fn install_updates_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.updates_is_managed() — WUA IUpdateServiceManager2 → IsDefaultAUService → IsManaged.
+    // Mirrors UpdatesIsManaged.cs (ComplianceApp). Deviation #26.
+    // Shares the `au_service` cache with updates_managed_by (#27): the
+    // expensive service-collection enumeration runs once per run, and
+    // init failures are surfaced under the canonical key
+    // `ERR_KEY_AU_SERVICE` (no per-binding key).
+    {
+        let s = state.clone();
+        host.set(
+            "updates_is_managed",
+            lua.create_function(move |_, ()| {
+                let mut st = s.borrow_mut();
+                Ok(st
+                    .ensure_au_service()
+                    .map(|(managed, _)| if *managed { "Managed" } else { "Unmanaged" }.to_string()))
+            })?,
+        )?;
+    }
+
+    // host.updates_managed_by() — WUA IUpdateServiceManager2 → IsDefaultAUService → Name.
+    // Mirrors UpdatesManagedBy.cs. Deviation #27.  Shares au_service cache with #26.
+    {
+        let s = state.clone();
+        host.set(
+            "updates_managed_by",
+            lua.create_function(move |_, ()| {
+                let mut st = s.borrow_mut();
+                Ok(st.ensure_au_service().map(|(_, name)| name.clone()))
+            })?,
+        )?;
+    }
+
+    // host.updates_reboot_required() — WUA ISystemInformation::RebootRequired.
+    // Mirrors UpdatesRebootRequired.cs. Deviation #28.
+    {
+        let s = state.clone();
+        host.set(
+            "updates_reboot_required",
+            lua.create_function(move |_, ()| {
+                let mut st = s.borrow_mut();
+                match updates::updates_reboot_required() {
+                    Ok(v) => Ok(Some(v)),
+                    Err(e) => {
+                        st.record_error("updates_reboot_required", e);
+                        Ok(None)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.updates_reboot_required_before_installation() — WUA IUpdateInstaller.
+    // Mirrors UpdatesRebootRequiredBeforeInstallation.cs. Deviation #29.
+    {
+        let s = state.clone();
+        host.set(
+            "updates_reboot_required_before_installation",
+            lua.create_function(move |_, ()| {
+                let mut st = s.borrow_mut();
+                match updates::updates_reboot_required_before_installation() {
+                    Ok(v) => Ok(Some(v)),
+                    Err(e) => {
+                        st.record_error("updates_reboot_required_before_installation", e);
+                        Ok(None)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.updates_windows_updates() — WUA IUpdateSession3 offline search.
+    // Mirrors UpdatesWindowsUpdates.cs. Deviation #30.
+    // Shares the offline-search cache with updates_sccm_updates (#31).
+    {
+        let s = state.clone();
+        host.set(
+            "updates_windows_updates",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                // Extract owned values from the cache so the borrow ends before
+                // we call record_error (which needs &mut self again).  The clone
+                // of `windows_updates` is intentional: this binding is documented
+                // as idempotent — calling it twice in the same run must yield
+                // identical owned data both times, not move the cache out.  On
+                // a realistic endpoint (500 updates × 20 JSON fields ≈ a few MB)
+                // the clone is dominated by the WUA search cost we just saved.
+                let payload = st
+                    .ensure_updates_cache()
+                    .map(|c| (c.wua_skips, c.windows_updates.clone()));
+                match payload {
+                    Some((skips, rows)) => {
+                        if skips > 0 {
+                            st.record_error(
+                                "updates_windows_updates:partial",
+                                format!(
+                                    "{skips} WUA update(s) skipped (missing UpdateID or get_Item failure)"
+                                ),
+                            );
+                        }
+                        let value = serde_json::Value::Array(rows);
+                        Ok(lua_to_value_or_nil(lua, &mut st, "updates_windows_updates", &value))
+                    }
+                    // Cache init failed: ensure_updates_cache already recorded
+                    // the diagnostic under `ERR_KEY_WUA_CACHE_INIT`.  No need
+                    // to add a binding-specific key.
+                    None => Ok(Value::Nil),
+                }
+            })?,
+        )?;
+    }
+
+    // host.updates_sccm_updates() — WMI Root\ccm + WUA offline join.
+    // Mirrors UpdatesSccmUpdates.cs. Returns [] when no SCCM agent. Deviation #31.
+    {
+        let s = state.clone();
+        host.set(
+            "updates_sccm_updates",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                // Trigger cache init; on failure, the canonical diagnostic
+                // `ERR_KEY_WUA_CACHE_INIT` is already recorded by
+                // ensure_updates_cache and we proceed without enrichment —
+                // the SCCM rows still come through (fix #2: best-effort).
+                let result =
+                    updates::updates_sccm_updates(st.ensure_updates_cache().map(|c| &c.index));
+                match result {
+                    Ok(rows) => {
+                        let value = serde_json::Value::Array(rows);
+                        Ok(lua_to_value_or_nil(
+                            lua,
+                            &mut st,
+                            "updates_sccm_updates",
+                            &value,
+                        ))
+                    }
+                    Err(e) => {
+                        st.record_error("updates_sccm_updates", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
 
     Ok(())
 }

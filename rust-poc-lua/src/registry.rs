@@ -8,6 +8,7 @@
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, REG_DWORD, REG_EXPAND_SZ,
     REG_MULTI_SZ, REG_QWORD, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
@@ -75,22 +76,55 @@ pub(super) fn read(hive: &str, key: &str, value: &str) -> Result<Option<Value>, 
 }
 
 /// Returns the names of all direct subkeys of `key` in `hive`.
-/// Returns an empty `Vec` when the key is absent or has no subkeys.
+/// Returns an empty `Vec` when the key is absent, has no subkeys, or
+/// could not be opened for any other reason — failures are absorbed
+/// silently to keep the call site simple.
+///
+/// **Most callers should keep using this function.**  Use
+/// [`try_subkey_names`] only when you need to distinguish "key absent"
+/// from "open failed" (e.g. to record a diagnostic).
 pub(super) fn subkey_names(hive: &str, key: &str) -> Vec<String> {
+    try_subkey_names(hive, key).unwrap_or_default()
+}
+
+/// Variant of [`subkey_names`] that distinguishes "key absent" from
+/// "open failed".
+///
+/// - `Ok(vec![])` — the key opens with no subkeys, **or** the key path
+///   does not exist (`ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND`).
+///   Both outcomes look identical to the caller of [`subkey_names`].
+/// - `Ok(vec![...])` — subkeys enumerated successfully.
+/// - `Err(_)` — `RegOpenKeyExW` failed for any other reason (access
+///   denied, registry corruption, etc.).  The error message embeds the
+///   hive, the key path, and the raw Win32 status code so the caller
+///   can record it under `host.errors()` for the operator.
+///
+/// Currently used by `software::os_software_installed` to surface the
+/// (rare but real) case where the `HKLM\…\Uninstall` hive cannot be
+/// opened — otherwise the binding would emit an empty array with no
+/// trace of the failure.
+pub(super) fn try_subkey_names(hive: &str, key: &str) -> Result<Vec<String>, String> {
     let root: HKEY = match hive {
         "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
         "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
         "HKU" | "HKEY_USERS" => HKEY_USERS,
-        _ => return Vec::new(),
+        other => return Err(format!("unsupported hive: {other}")),
     };
 
     let mut hkey = HKEY::default();
     let key_w: HSTRING = key.into();
     // SAFETY: HSTRING lives for the call; KEY_READ is a non-destructive flag.
-    let opened =
-        unsafe { RegOpenKeyExW(root, PCWSTR(key_w.as_ptr()), None, KEY_READ, &mut hkey).is_ok() };
-    if !opened {
-        return Vec::new();
+    let r = unsafe { RegOpenKeyExW(root, PCWSTR(key_w.as_ptr()), None, KEY_READ, &mut hkey) };
+    if r == ERROR_FILE_NOT_FOUND || r == ERROR_PATH_NOT_FOUND {
+        // Missing key is a normal outcome (e.g. a per-user uninstall hive
+        // for a profile that never installed anything).
+        return Ok(Vec::new());
+    }
+    if r.is_err() {
+        return Err(format!(
+            "RegOpenKeyExW({hive}\\{key}) failed with WIN32_ERROR({})",
+            r.0
+        ));
     }
 
     let mut names = Vec::new();
@@ -128,7 +162,7 @@ pub(super) fn subkey_names(hive: &str, key: &str) -> Vec<String> {
     unsafe {
         let _ = RegCloseKey(hkey);
     }
-    names
+    Ok(names)
 }
 
 fn decode(t: REG_VALUE_TYPE, buf: &[u8]) -> Option<Value> {
@@ -166,4 +200,42 @@ fn utf16_to_string(buf: &[u8]) -> String {
         .collect();
     let s: OsString = OsString::from_wide(&words);
     s.to_string_lossy().trim_end_matches('\0').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_subkey_names;
+
+    /// `HKLM\SOFTWARE` exists on every Windows install and has many
+    /// subkeys — happy path.
+    #[test]
+    fn try_subkey_names_existing_hive_returns_non_empty() {
+        // let-else avoids the workspace-wide clippy::expect_used ban
+        // while still producing a clear panic message on failure.
+        let Ok(names) = try_subkey_names("HKLM", "SOFTWARE") else {
+            panic!("HKLM\\SOFTWARE should always open on a healthy Windows install");
+        };
+        assert!(
+            !names.is_empty(),
+            "HKLM\\SOFTWARE always has subkeys (Microsoft, Classes, …)"
+        );
+    }
+
+    /// A key path crafted to be absent must collapse to `Ok(vec![])` — the
+    /// `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND` branch.  This is
+    /// the load-bearing distinction for `software::os_software_installed`:
+    /// "key not there" must not become an operator-visible error.
+    #[test]
+    fn try_subkey_names_absent_key_returns_empty_ok() {
+        let result = try_subkey_names("HKLM", r"SOFTWARE\This-Key-Does-Not-Exist-rust-poc-12345");
+        assert_eq!(result, Ok(Vec::new()));
+    }
+
+    /// An unsupported hive string is an `Err`, not an empty vec — callers
+    /// that misuse the API get a diagnostic instead of silent emptiness.
+    #[test]
+    fn try_subkey_names_unsupported_hive_returns_err() {
+        let result = try_subkey_names("BOGUS_HIVE", "anything");
+        assert!(matches!(result, Err(ref msg) if msg.contains("BOGUS_HIVE")));
+    }
 }

@@ -140,8 +140,24 @@ fn parse_install_date(s: &str) -> Option<String> {
 
 /// Reads all sub-keys under `{hive}\{base_key}` and maps them to software
 /// entries with the given `context`. Skips sub-keys without a `DisplayName`.
-fn read_uninstall_entries(hive: &str, base_key: &str, context: &str) -> Vec<Value> {
-    let sub_keys = super::registry::subkey_names(hive, base_key);
+///
+/// The second element of the returned tuple distinguishes:
+/// - `Ok(())`  — the hive opened (with zero or more entries), **or** the
+///   key path is absent (a per-user hive for a profile that installed
+///   nothing is a normal case);
+/// - `Err(msg)` — `RegOpenKeyExW` failed for any other reason (access
+///   denied, etc.).  `os_software_installed` aggregates these so the
+///   operator sees `os_software_installed:registry` in `host.errors()`
+///   instead of silently getting an empty (or partial) array.
+fn read_uninstall_entries(
+    hive: &str,
+    base_key: &str,
+    context: &str,
+) -> (Vec<Value>, Result<(), String>) {
+    let sub_keys = match super::registry::try_subkey_names(hive, base_key) {
+        Ok(v) => v,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
     let mut rows = Vec::with_capacity(sub_keys.len());
 
     for sub in &sub_keys {
@@ -189,64 +205,51 @@ fn read_uninstall_entries(hive: &str, base_key: &str, context: &str) -> Vec<Valu
         }));
     }
 
-    rows
+    (rows, Ok(()))
 }
 
-/// Returns all installed software from the Windows Uninstall registry keys.
+/// Deduplicates Uninstall registry rows by
+/// `(context, publisher, display_name, version, software_code)`.
 ///
-/// Machine-context entries come from `HKLM\…\Uninstall` (64-bit and 32-bit).
-/// Per-user entries are read from `HKEY_USERS\{SID}\…\Uninstall` for every
-/// **Active** domain session reported by `WTSEnumerateSessionsW`.
+/// When two rows share the same key, the **non**-`system_component` entry
+/// wins (mirrors `ComplianceApp`'s pickier MSI/EXE rule).  Insertion
+/// order is preserved among kept entries — `os_software_installed`
+/// reorders deterministically afterwards.
 ///
-/// Mirrors `OSSoftwareInstalled.cs` + `OperatingSystem.GetSoftwareInstalled()`.
+/// ## Strong-identifier guard
 ///
-/// # Examples
+/// A row only participates in deduplication when **at least one** of
+/// `publisher`, `version`, or `software_code` is non-empty.  Without
+/// this guard, two genuinely distinct apps that happen to share a
+/// `display_name` and lack every optional field would map to the same
+/// `(context, "", display_name, "", "")` key and silently collapse —
+/// silent data loss.  Weak-identity rows therefore each occupy their
+/// own slot in the output.
 ///
-/// ```ignore
-/// let (apps, wts_err) = os_software_installed();
-/// // apps: [{"context": "Machine", "display_name": "Git", "version": "2.44.0", ...}, ...]
-/// // wts_err: None (or Some("WTSEnumerateSessionsW failed: ...") when WTS is unavailable)
-/// ```
-///
-/// # Errors (second element)
-///
-/// The second element of the returned tuple is `Some(message)` when
-/// `WTSEnumerateSessionsW` fails. The caller should record this under
-/// `"os_software_installed:wts"` in `host.errors()` so the operator knows
-/// that per-user software is absent, not merely empty.
-pub(super) fn os_software_installed() -> (Vec<Value>, Option<String>) {
-    let mut all: Vec<Value> = Vec::new();
-
-    // Machine-context (always present).
-    all.extend(read_uninstall_entries("HKLM", UNINSTALL_64, "Machine"));
-    all.extend(read_uninstall_entries("HKLM", UNINSTALL_32, "Machine"));
-
-    // Per-user context: live WTS sessions only (no persistence).
-    let wts_err = match super::wts::active_domain_sessions() {
-        Ok(sessions) => {
-            for (sid, nt_account) in sessions {
-                let key64 = format!("{sid}\\{UNINSTALL_64}");
-                let key32 = format!("{sid}\\{UNINSTALL_32}");
-                all.extend(read_uninstall_entries("HKU", &key64, &nt_account));
-                all.extend(read_uninstall_entries("HKU", &key32, &nt_account));
-            }
-            None
-        }
-        Err(e) => Some(e),
-    };
-
-    // Deduplicate: same (context, publisher, display_name, version, software_code).
-    // When duplicated, prefer system_component = false (mirrors ComplianceApp).
+/// Extracted from [`os_software_installed`] so the rule can be exercised
+/// by unit tests without touching the registry.
+fn deduplicate_software(rows: Vec<Value>) -> Vec<Value> {
     let mut seen: HashMap<(String, String, String, String, String), usize> = HashMap::new();
     let mut deduped: Vec<Value> = Vec::new();
 
-    for row in all {
+    for row in rows {
+        let publisher = row["publisher"].as_str().unwrap_or("");
+        let version = row["version"].as_str().unwrap_or("");
+        let software_code = row["software_code"].as_str().unwrap_or("");
+
+        // Strong-identifier guard: rows with zero optional metadata are
+        // never merged.  See doc-comment above.
+        if publisher.is_empty() && version.is_empty() && software_code.is_empty() {
+            deduped.push(row);
+            continue;
+        }
+
         let key = (
             row["context"].as_str().unwrap_or("").to_string(),
-            row["publisher"].as_str().unwrap_or("").to_string(),
+            publisher.to_string(),
             row["display_name"].as_str().unwrap_or("").to_string(),
-            row["version"].as_str().unwrap_or("").to_string(),
-            row["software_code"].as_str().unwrap_or("").to_string(),
+            version.to_string(),
+            software_code.to_string(),
         );
         let is_sys = row["system_component"].as_bool().unwrap_or(false);
 
@@ -261,6 +264,81 @@ pub(super) fn os_software_installed() -> (Vec<Value>, Option<String>) {
         }
     }
 
+    deduped
+}
+
+/// Returns all installed software from the Windows Uninstall registry keys.
+///
+/// Machine-context entries come from `HKLM\…\Uninstall` (64-bit and 32-bit).
+/// Per-user entries are read from `HKEY_USERS\{SID}\…\Uninstall` for every
+/// **Active** domain session reported by `WTSEnumerateSessionsW`.
+///
+/// Mirrors `OSSoftwareInstalled.cs` + `OperatingSystem.GetSoftwareInstalled()`.
+///
+/// # Examples
+///
+/// ```ignore
+/// let (apps, wts_err, registry_err) = os_software_installed();
+/// // apps:        [{"context": "Machine", "display_name": "Git", ...}, ...]
+/// // wts_err:     None | Some("WTSEnumerateSessionsW failed: ...")
+/// // registry_err: None | Some("HKLM\\…\\Uninstall: RegOpenKeyExW(...) failed ...")
+/// ```
+///
+/// # Errors (second and third elements)
+///
+/// The second element is `Some(message)` when `WTSEnumerateSessionsW`
+/// fails — record it under `"os_software_installed:wts"` so the operator
+/// knows that per-user software is absent, not merely empty.
+///
+/// The third element is `Some(message)` when **at least one** HKLM
+/// Uninstall hive could not be opened for a reason other than absence
+/// (i.e. the operator likely lacks read permission or the registry is
+/// inaccessible) — record it under `"os_software_installed:registry"`.
+/// HKU failures are intentionally absorbed: a profile without a loaded
+/// hive is a normal best-effort case, not an operator-actionable error.
+#[must_use = "callers must record the WTS / registry diagnostics in host.errors()"]
+pub(super) fn os_software_installed() -> (Vec<Value>, Option<String>, Option<String>) {
+    let mut all: Vec<Value> = Vec::new();
+    let mut registry_errors: Vec<String> = Vec::new();
+
+    // Machine-context (always present on healthy installs).
+    let (rows64, err64) = read_uninstall_entries("HKLM", UNINSTALL_64, "Machine");
+    all.extend(rows64);
+    if let Err(e) = err64 {
+        registry_errors.push(format!("HKLM\\{UNINSTALL_64}: {e}"));
+    }
+    let (rows32, err32) = read_uninstall_entries("HKLM", UNINSTALL_32, "Machine");
+    all.extend(rows32);
+    if let Err(e) = err32 {
+        registry_errors.push(format!("HKLM\\{UNINSTALL_32}: {e}"));
+    }
+
+    let registry_err = if registry_errors.is_empty() {
+        None
+    } else {
+        Some(registry_errors.join("; "))
+    };
+
+    // Per-user context: live WTS sessions only (no persistence).  HKU
+    // open failures are intentionally absorbed — a profile without a
+    // loaded hive is a normal case, not an operator-actionable error.
+    let wts_err = match super::wts::active_domain_sessions() {
+        Ok(sessions) => {
+            for (sid, nt_account) in sessions {
+                let key64 = format!("{sid}\\{UNINSTALL_64}");
+                let key32 = format!("{sid}\\{UNINSTALL_32}");
+                let (r64, _) = read_uninstall_entries("HKU", &key64, &nt_account);
+                let (r32, _) = read_uninstall_entries("HKU", &key32, &nt_account);
+                all.extend(r64);
+                all.extend(r32);
+            }
+            None
+        }
+        Err(e) => Some(e),
+    };
+
+    let mut deduped = deduplicate_software(all);
+
     // Sort: context ordinal ("Machine" < SID strings), then display_name ASC.
     deduped.sort_by(|a, b| {
         let ca = a["context"].as_str().unwrap_or("");
@@ -272,7 +350,7 @@ pub(super) fn os_software_installed() -> (Vec<Value>, Option<String>) {
         })
     });
 
-    (deduped, wts_err)
+    (deduped, wts_err, registry_err)
 }
 
 // =============================================================================
@@ -287,10 +365,12 @@ struct ScHandle(SC_HANDLE);
 
 impl Drop for ScHandle {
     fn drop(&mut self) {
-        if !self.0 .0.is_null() {
+        if !self.0.0.is_null() {
             // SAFETY: `self.0` is a valid SC_HANDLE returned by OpenSCManagerW
             // or OpenServiceW. CloseServiceHandle is idempotent on valid handles.
-            unsafe { let _ = CloseServiceHandle(self.0); }
+            unsafe {
+                let _ = CloseServiceHandle(self.0);
+            }
         }
     }
 }
@@ -353,24 +433,32 @@ unsafe fn pwstr_to_string(ptr: *const u16) -> String {
 ///
 /// Uses Win32 SC Manager APIs instead of WMI for lower overhead.
 ///
+/// The second element of the returned tuple is the count of services
+/// for which `OpenServiceW` failed (typically: the service was removed
+/// between the enumeration and the per-service open).  Those rows are
+/// emitted with `start_mode`, `path_name` and `start_name` set to
+/// `null` — the caller records `os_services:partial` so the operator
+/// knows that some config fields are missing rather than empty.
+///
 /// # Errors
 ///
-/// Returns a descriptive `String` when `OpenSCManagerW` fails.
+/// Returns a descriptive `String` when `OpenSCManagerW` itself fails
+/// (the all-or-nothing failure that means we got zero services).
 ///
 /// # Examples
 ///
 /// ```ignore
-/// let svcs = os_services()?;
-/// // [{"display_name": "Windows Update", "state": "Running", ...}, ...]
+/// let (svcs, partial) = os_services()?;
+/// // svcs:    [{"display_name": "Windows Update", "state": "Running", ...}, ...]
+/// // partial: 0 on a quiescent machine; > 0 when services were removed mid-enum
 /// ```
 #[allow(clippy::too_many_lines)]
-pub(super) fn os_services() -> Result<Vec<Value>, String> {
+pub(super) fn os_services() -> Result<(Vec<Value>, u32), String> {
     // Open Service Control Manager with enumerate access.
     // SAFETY: null PCWSTR is valid for the local machine / default database.
-    let hsc = unsafe {
-        OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE)
-    }
-    .map_err(|e| format!("OpenSCManagerW failed: {e}"))?;
+    let hsc =
+        unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE) }
+            .map_err(|e| format!("OpenSCManagerW failed: {e}"))?;
     let _hsc = ScHandle(hsc);
 
     // First call: determine required buffer size (null buffer → ERROR_MORE_DATA).
@@ -380,7 +468,7 @@ pub(super) fn os_services() -> Result<Vec<Value>, String> {
     unsafe {
         let _ = EnumServicesStatusExW(
             hsc,
-            SC_ENUM_TYPE(0),                   // SC_ENUM_PROCESS_INFO = 0
+            SC_ENUM_TYPE(0), // SC_ENUM_PROCESS_INFO = 0
             ENUM_SERVICE_TYPE(SERVICE_WIN32),
             ENUM_SERVICE_STATE(SERVICE_STATE_ALL),
             None,
@@ -392,7 +480,7 @@ pub(super) fn os_services() -> Result<Vec<Value>, String> {
     }
 
     if needed == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     // Second call: fill buffer with all service entries.
@@ -427,26 +515,21 @@ pub(super) fn os_services() -> Result<Vec<Value>, String> {
     };
 
     let mut rows: Vec<Value> = Vec::with_capacity(returned as usize);
+    let mut partial_skips: u32 = 0;
 
     for entry in entries {
         // SAFETY: lpServiceName/lpDisplayName are valid null-terminated UTF-16
         // strings within `buf` for the lifetime of this loop.
-        let short_name =
-            unsafe { pwstr_to_string(entry.lpServiceName.as_ptr().cast_const()) };
-        let display_name =
-            unsafe { pwstr_to_string(entry.lpDisplayName.as_ptr().cast_const()) };
+        let short_name = unsafe { pwstr_to_string(entry.lpServiceName.as_ptr().cast_const()) };
+        let display_name = unsafe { pwstr_to_string(entry.lpDisplayName.as_ptr().cast_const()) };
         let state = service_state_label(entry.ServiceStatusProcess.dwCurrentState.0);
 
         // Open the individual service for config queries.
-        let hsvc_result = unsafe {
-            OpenServiceW(
-                hsc,
-                entry.lpServiceName,
-                SERVICE_QUERY_CONFIG,
-            )
-        };
+        let hsvc_result = unsafe { OpenServiceW(hsc, entry.lpServiceName, SERVICE_QUERY_CONFIG) };
         let Ok(hsvc_raw) = hsvc_result else {
-            // Service may have been removed since enumeration; emit partial row.
+            // Service may have been removed since enumeration; emit partial
+            // row and count it so the caller can surface `os_services:partial`.
+            partial_skips = partial_skips.saturating_add(1);
             rows.push(json!({
                 "display_name":      display_name,
                 "start_mode":        Value::Null,
@@ -482,8 +565,7 @@ pub(super) fn os_services() -> Result<Vec<Value>, String> {
                 // SAFETY: QueryServiceConfigW fills cfg_buf as QUERY_SERVICE_CONFIGW;
                 // all pointer fields point into the trailing string data within cfg_buf.
                 #[allow(clippy::cast_ptr_alignment)]
-                let cfg =
-                    unsafe { &*cfg_buf.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
+                let cfg = unsafe { &*cfg_buf.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
                 (
                     start_mode_label(cfg.dwStartType.0),
                     unsafe { pwstr_to_string(cfg.lpBinaryPathName.as_ptr().cast_const()) },
@@ -533,7 +615,7 @@ pub(super) fn os_services() -> Result<Vec<Value>, String> {
         da.cmp(&db)
     });
 
-    Ok(rows)
+    Ok((rows, partial_skips))
 }
 
 // =============================================================================
@@ -547,19 +629,19 @@ pub(super) fn os_services() -> Result<Vec<Value>, String> {
 /// `"Unknown(<n>)"`.
 fn manifest_location_label(code: i64) -> String {
     match code {
-        0  => "InvalidLocation".to_string(),
-        1  => "Internal".to_string(),
-        2  => "ExternalPref".to_string(),
-        3  => "ExternalRegistry".to_string(),
-        4  => "Unpacked".to_string(),
-        5  => "Component".to_string(),
-        6  => "ExternalPrefDownload".to_string(),
-        7  => "ExternalRegistryDownload".to_string(),
-        8  => "ExternalPolicy".to_string(),
-        9  => "ExternalPolicyDownload".to_string(),
+        0 => "InvalidLocation".to_string(),
+        1 => "Internal".to_string(),
+        2 => "ExternalPref".to_string(),
+        3 => "ExternalRegistry".to_string(),
+        4 => "Unpacked".to_string(),
+        5 => "Component".to_string(),
+        6 => "ExternalPrefDownload".to_string(),
+        7 => "ExternalRegistryDownload".to_string(),
+        8 => "ExternalPolicy".to_string(),
+        9 => "ExternalPolicyDownload".to_string(),
         10 => "CommandLine".to_string(),
         11 => "ExternalComponent".to_string(),
-        n  => format!("Unknown({n})"),
+        n => format!("Unknown({n})"),
     }
 }
 
@@ -591,9 +673,8 @@ impl ExtensionPrefs {
 fn parse_single_prefs(obj: &serde_json::Value) -> ExtensionPrefs {
     let enabled = obj.get("state").and_then(Value::as_i64) != Some(0);
 
-    let location = manifest_location_label(
-        obj.get("location").and_then(Value::as_i64).unwrap_or(0),
-    );
+    let location =
+        manifest_location_label(obj.get("location").and_then(Value::as_i64).unwrap_or(0));
 
     let disable_reasons = if let Some(v) = obj.get("disable_reasons") {
         if let Some(n) = v.as_i64() {
@@ -621,13 +702,18 @@ fn parse_single_prefs(obj: &serde_json::Value) -> ExtensionPrefs {
         .and_then(Value::as_i64)
         .unwrap_or(0);
 
-    let acknowledged = ["ack_external", "ack_settings_overridden",
-                        "ack_ntp_overridden", "ack_search_provider_overridden"]
-        .iter()
-        .any(|k| obj.get(*k).and_then(Value::as_bool).unwrap_or(false))
-        || obj.get("ack_prompt_count")
-               .and_then(Value::as_i64)
-               .is_some_and(|n| n > 0);
+    let acknowledged = [
+        "ack_external",
+        "ack_settings_overridden",
+        "ack_ntp_overridden",
+        "ack_search_provider_overridden",
+    ]
+    .iter()
+    .any(|k| obj.get(*k).and_then(Value::as_bool).unwrap_or(false))
+        || obj
+            .get("ack_prompt_count")
+            .and_then(Value::as_i64)
+            .is_some_and(|n| n > 0);
 
     let (granted_api_permissions, granted_host_permissions) =
         if let Some(gp) = obj.get("granted_permissions").and_then(Value::as_object) {
@@ -716,7 +802,10 @@ fn resolve_chromium_locale(value: &str, version_path: &Path) -> String {
         return value.to_string();
     }
     let key = &value[6..value.len() - 2];
-    let locales_path = version_path.join("_locales").join("en").join("messages.json");
+    let locales_path = version_path
+        .join("_locales")
+        .join("en")
+        .join("messages.json");
     let Ok(content) = std::fs::read_to_string(&locales_path) else {
         return value.to_string();
     };
@@ -759,19 +848,37 @@ fn get_extension_details(version_path: &Path) -> Option<ExtensionDetails> {
     let content = std::fs::read_to_string(&manifest_path).ok()?;
     let doc: Value = serde_json::from_str(&content).ok()?;
 
-    let version = doc.get("version").and_then(Value::as_str).unwrap_or("").to_string();
-    let raw_name = doc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-    let raw_desc = doc.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+    let version = doc
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let raw_name = doc
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let raw_desc = doc
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let name = resolve_chromium_locale(&raw_name, version_path);
     let description = resolve_chromium_locale(&raw_desc, version_path);
-    let manifest_version = doc.get("manifest_version").and_then(Value::as_i64).unwrap_or(0);
-    let update_url = doc.get("update_url").and_then(Value::as_str).unwrap_or("").to_string();
+    let manifest_version = doc
+        .get("manifest_version")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let update_url = doc
+        .get("update_url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
 
     let permissions = extract_json_string_array(doc.get("permissions"));
     let host_permissions = extract_json_string_array(doc.get("host_permissions"));
     let optional_permissions = extract_json_string_array(doc.get("optional_permissions"));
-    let optional_host_permissions =
-        extract_json_string_array(doc.get("optional_host_permissions"));
+    let optional_host_permissions = extract_json_string_array(doc.get("optional_host_permissions"));
 
     let background_type = if let Some(bg) = doc.get("background") {
         if bg.get("service_worker").is_some() {
@@ -788,19 +895,20 @@ fn get_extension_details(version_path: &Path) -> Option<ExtensionDetails> {
     }
     .to_string();
 
-    let content_script_matches = if let Some(arr) = doc.get("content_scripts").and_then(Value::as_array) {
-        let mut matches: Vec<String> = arr
-            .iter()
-            .filter_map(|cs| cs.get("matches").and_then(Value::as_array))
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect();
-        matches.dedup();
-        matches.join(", ")
-    } else {
-        String::new()
-    };
+    let content_script_matches =
+        if let Some(arr) = doc.get("content_scripts").and_then(Value::as_array) {
+            let mut matches: Vec<String> = arr
+                .iter()
+                .filter_map(|cs| cs.get("matches").and_then(Value::as_array))
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            matches.dedup();
+            matches.join(", ")
+        } else {
+            String::new()
+        };
 
     let content_security_policy = if let Some(csp) = doc.get("content_security_policy") {
         if let Some(s) = csp.as_str() {
@@ -835,9 +943,8 @@ fn get_extension_details(version_path: &Path) -> Option<ExtensionDetails> {
 /// splitting on `.` and comparing each component numerically. Falls back to
 /// lexicographic comparison for non-numeric components.
 fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split('.').filter_map(|p| p.parse::<u64>().ok()).collect()
-    };
+    let parse =
+        |s: &str| -> Vec<u64> { s.split('.').filter_map(|p| p.parse::<u64>().ok()).collect() };
     parse(a).cmp(&parse(b))
 }
 
@@ -868,13 +975,19 @@ fn latest_version_dir(ext_dir: &Path) -> Option<PathBuf> {
 
 /// Browser definitions: (name, relative path from `ProfileImagePath`).
 const BROWSERS: &[(&str, &str)] = &[
-    ("Edge",     r"AppData\Local\Microsoft\Edge\User Data"),
-    ("Chrome",   r"AppData\Local\Google\Chrome\User Data"),
-    ("Brave",    r"AppData\Local\BraveSoftware\Brave-Browser\User Data"),
-    ("Vivaldi",  r"AppData\Local\Vivaldi\User Data"),
-    ("Arc",      r"AppData\Local\Arc\User Data"),
-    ("Opera",    r"AppData\Roaming\Opera Software\Opera Stable"),
-    ("Opera GX", r"AppData\Roaming\Opera Software\Opera GX Stable"),
+    ("Edge", r"AppData\Local\Microsoft\Edge\User Data"),
+    ("Chrome", r"AppData\Local\Google\Chrome\User Data"),
+    (
+        "Brave",
+        r"AppData\Local\BraveSoftware\Brave-Browser\User Data",
+    ),
+    ("Vivaldi", r"AppData\Local\Vivaldi\User Data"),
+    ("Arc", r"AppData\Local\Arc\User Data"),
+    ("Opera", r"AppData\Roaming\Opera Software\Opera Stable"),
+    (
+        "Opera GX",
+        r"AppData\Roaming\Opera Software\Opera GX Stable",
+    ),
 ];
 
 /// Returns all browser extensions installed for all users, matching the full
@@ -886,17 +999,35 @@ const BROWSERS: &[(&str, &str)] = &[
 /// # Examples
 ///
 /// ```ignore
-/// let exts = browser_extensions_installed();
-/// // [{"browser": "Edge", "name": "uBlock Origin", "enabled": true, ...}, ...]
+/// let (exts, err) = browser_extensions_installed();
+/// // exts: [{"browser": "Edge", "name": "uBlock Origin", ...}, ...]
+/// // err:  None | Some("RegOpenKeyExW(HKLM\\…\\ProfileList) failed ...")
 /// ```
-#[must_use]
+///
+/// # Errors (second element)
+///
+/// `Some(message)` when the profile enumeration itself failed (HKLM
+/// `ProfileList` inaccessible).  Per-profile / per-file errors are
+/// **intentionally absorbed**: a single missing `manifest.json` or
+/// unreadable `Preferences` would otherwise produce dozens of error
+/// rows under a healthy machine.  The convention is "best-effort with
+/// a single fundamental-failure key" — record under
+/// `"browser_extensions_installed"` in `host.errors()`.
+#[must_use = "callers must record the ProfileList diagnostic in host.errors()"]
 #[allow(clippy::too_many_lines)]
-pub(super) fn browser_extensions_installed() -> Vec<Value> {
-    let profiles = super::accounts::profile_list();
+pub(super) fn browser_extensions_installed() -> (Vec<Value>, Option<String>) {
+    let (profiles, profile_err) = match super::accounts::try_profile_list() {
+        Ok(p) => (p, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     let mut rows: Vec<Value> = Vec::new();
 
     for (sid, nt_account, profile_path) in &profiles {
-        let user_profile = if nt_account.is_empty() { sid.as_str() } else { nt_account.as_str() };
+        let user_profile = if nt_account.is_empty() {
+            sid.as_str()
+        } else {
+            nt_account.as_str()
+        };
 
         for (browser_name, rel_path) in BROWSERS {
             let user_data = profile_path.join(rel_path);
@@ -920,9 +1051,7 @@ pub(super) fn browser_extensions_installed() -> Vec<Value> {
                     .filter(|p| {
                         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                         name.eq_ignore_ascii_case("Default")
-                            || name
-                                .to_ascii_uppercase()
-                                .starts_with("PROFILE")
+                            || name.to_ascii_uppercase().starts_with("PROFILE")
                     })
                     .collect()
             };
@@ -944,10 +1073,8 @@ pub(super) fn browser_extensions_installed() -> Vec<Value> {
                 // Load Preferences once per browser profile (may be multi-MB).
                 let prefs_text = try_read(&profile_folder.join("Preferences"));
                 let secure_prefs_text = try_read(&profile_folder.join("Secure Preferences"));
-                let prefs_map = parse_chromium_preferences(
-                    prefs_text.as_deref(),
-                    secure_prefs_text.as_deref(),
-                );
+                let prefs_map =
+                    parse_chromium_preferences(prefs_text.as_deref(), secure_prefs_text.as_deref());
 
                 let Ok(ext_dirs) = std::fs::read_dir(&ext_root) else {
                     continue;
@@ -972,18 +1099,19 @@ pub(super) fn browser_extensions_installed() -> Vec<Value> {
                         .and_then(|m| m.modified().ok())
                         .and_then(systime_to_iso8601);
 
-                    let prefs = prefs_map
-                        .get(&ext_id)
-                        .map_or_else(ExtensionPrefs::default_enabled, |p| ExtensionPrefs {
-                            enabled: p.enabled,
-                            location: p.location.clone(),
-                            disable_reasons: p.disable_reasons,
-                            blocklist_state: p.blocklist_state,
-                            creation_flags: p.creation_flags,
-                            acknowledged: p.acknowledged,
-                            granted_api_permissions: p.granted_api_permissions.clone(),
-                            granted_host_permissions: p.granted_host_permissions.clone(),
-                        });
+                    let prefs =
+                        prefs_map
+                            .get(&ext_id)
+                            .map_or_else(ExtensionPrefs::default_enabled, |p| ExtensionPrefs {
+                                enabled: p.enabled,
+                                location: p.location.clone(),
+                                disable_reasons: p.disable_reasons,
+                                blocklist_state: p.blocklist_state,
+                                creation_flags: p.creation_flags,
+                                acknowledged: p.acknowledged,
+                                granted_api_permissions: p.granted_api_permissions.clone(),
+                                granted_host_permissions: p.granted_host_permissions.clone(),
+                            });
 
                     // Use only the highest-versioned sub-folder to avoid
                     // duplicate rows when two versions coexist during an update.
@@ -1055,7 +1183,7 @@ pub(super) fn browser_extensions_installed() -> Vec<Value> {
         key(a).cmp(&key(b))
     });
 
-    rows
+    (rows, profile_err)
 }
 
 // =============================================================================
@@ -1104,7 +1232,11 @@ fn read_extensions_registry(path: &Path) -> HashMap<String, IdeRegistryEntry> {
             .to_string();
         map.insert(
             id.to_lowercase(),
-            IdeRegistryEntry { installed_timestamp_ms: timestamp, source, publisher_display_name },
+            IdeRegistryEntry {
+                installed_timestamp_ms: timestamp,
+                source,
+                publisher_display_name,
+            },
         );
     }
     map
@@ -1156,12 +1288,12 @@ fn parse_extension_folder_name(name: &str) -> (String, Option<String>) {
 
 /// IDE definitions: (display name, relative path from `ProfileImagePath`).
 const IDES: &[(&str, &str)] = &[
-    ("VSCode",          r".vscode\extensions"),
+    ("VSCode", r".vscode\extensions"),
     ("VSCode Insiders", r".vscode-insiders\extensions"),
-    ("Cursor",          r".cursor\extensions"),
-    ("Windsurf",        r".windsurf\extensions"),
-    ("VSCodium",        r".vscode-oss\extensions"),
-    ("Antigravity",     r".antigravity\extensions"),
+    ("Cursor", r".cursor\extensions"),
+    ("Windsurf", r".windsurf\extensions"),
+    ("VSCodium", r".vscode-oss\extensions"),
+    ("Antigravity", r".antigravity\extensions"),
 ];
 
 /// Returns all IDE extensions installed for all users, matching the full
@@ -1172,17 +1304,32 @@ const IDES: &[(&str, &str)] = &[
 /// # Examples
 ///
 /// ```ignore
-/// let exts = ide_extensions_installed();
-/// // [{"ide": "VSCode", "name": "Rust Analyzer", "publisher": "rust-lang", ...}, ...]
+/// let (exts, err) = ide_extensions_installed();
+/// // exts: [{"ide": "VSCode", "name": "Rust Analyzer", ...}, ...]
+/// // err:  None | Some("RegOpenKeyExW(HKLM\\…\\ProfileList) failed ...")
 /// ```
-#[must_use]
+///
+/// # Errors (second element)
+///
+/// Same semantics as [`browser_extensions_installed`]: `Some(message)`
+/// only when the profile enumeration itself failed.  Per-file / per-IDE
+/// errors are intentionally absorbed to keep noise low.  Record under
+/// `"ide_extensions_installed"` in `host.errors()`.
+#[must_use = "callers must record the ProfileList diagnostic in host.errors()"]
 #[allow(clippy::too_many_lines)]
-pub(super) fn ide_extensions_installed() -> Vec<Value> {
-    let profiles = super::accounts::profile_list();
+pub(super) fn ide_extensions_installed() -> (Vec<Value>, Option<String>) {
+    let (profiles, profile_err) = match super::accounts::try_profile_list() {
+        Ok(p) => (p, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     let mut rows: Vec<Value> = Vec::new();
 
     for (sid, nt_account, profile_path) in &profiles {
-        let user_profile = if nt_account.is_empty() { sid.as_str() } else { nt_account.as_str() };
+        let user_profile = if nt_account.is_empty() {
+            sid.as_str()
+        } else {
+            nt_account.as_str()
+        };
 
         for (ide_name, rel_path) in IDES {
             let ext_root = profile_path.join(rel_path);
@@ -1225,7 +1372,9 @@ pub(super) fn ide_extensions_installed() -> Vec<Value> {
                         }
                         _ => folder_name.clone(),
                     };
-                    let nm = p.display_name.as_deref()
+                    let nm = p
+                        .display_name
+                        .as_deref()
                         .or(p.name.as_deref())
                         .unwrap_or(&folder_name)
                         .to_string();
@@ -1241,20 +1390,32 @@ pub(super) fn ide_extensions_installed() -> Vec<Value> {
                 let reg = registry_map.get(&reg_key);
 
                 let publisher = if publisher.is_empty() {
-                    reg.map(|r| r.publisher_display_name.clone()).unwrap_or_default()
+                    reg.map(|r| r.publisher_display_name.clone())
+                        .unwrap_or_default()
                 } else {
                     publisher
                 };
-                let publisher_display_name = reg.map(|r| r.publisher_display_name.clone()).unwrap_or_default();
+                let publisher_display_name = reg
+                    .map(|r| r.publisher_display_name.clone())
+                    .unwrap_or_default();
                 let source = reg.map(|r| r.source.clone()).unwrap_or_default();
 
                 let install_date = reg
                     .filter(|r| r.installed_timestamp_ms > 0)
                     .and_then(|r| unix_ms_to_iso8601(r.installed_timestamp_ms));
 
-                let description = pkg.as_ref().and_then(|p| p.description.clone()).unwrap_or_default();
-                let categories = pkg.as_ref().and_then(|p| p.categories.clone()).unwrap_or_default();
-                let engine_vscode = pkg.as_ref().and_then(|p| p.engine_vscode.clone()).unwrap_or_default();
+                let description = pkg
+                    .as_ref()
+                    .and_then(|p| p.description.clone())
+                    .unwrap_or_default();
+                let categories = pkg
+                    .as_ref()
+                    .and_then(|p| p.categories.clone())
+                    .unwrap_or_default();
+                let engine_vscode = pkg
+                    .as_ref()
+                    .and_then(|p| p.engine_vscode.clone())
+                    .unwrap_or_default();
                 let wildcard_activation = pkg.as_ref().is_some_and(|p| p.wildcard_activation);
                 let post_install_script = pkg.as_ref().is_some_and(|p| p.post_install_script);
                 let dependency_count = pkg.as_ref().map_or(0, |p| p.dependency_count);
@@ -1295,7 +1456,7 @@ pub(super) fn ide_extensions_installed() -> Vec<Value> {
         key(a).cmp(&key(b))
     });
 
-    rows
+    (rows, profile_err)
 }
 
 /// Parsed fields from a VS Code extension's `package.json`.
@@ -1318,10 +1479,22 @@ fn try_read_package_json(path: &Path, ext_dir: &Path) -> Option<IdePackageJson> 
     let doc: Value = serde_json::from_str(&content).ok()?;
 
     let name = doc.get("name").and_then(Value::as_str).map(str::to_string);
-    let mut display_name = doc.get("displayName").and_then(Value::as_str).map(str::to_string);
-    let publisher = doc.get("publisher").and_then(Value::as_str).map(str::to_string);
-    let version = doc.get("version").and_then(Value::as_str).map(str::to_string);
-    let mut description = doc.get("description").and_then(Value::as_str).map(str::to_string);
+    let mut display_name = doc
+        .get("displayName")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let publisher = doc
+        .get("publisher")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let version = doc
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut description = doc
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     // Resolve NLS placeholders.
     if is_nls_placeholder(display_name.as_deref()) || is_nls_placeholder(description.as_deref()) {
@@ -1359,15 +1532,17 @@ fn try_read_package_json(path: &Path, ext_dir: &Path) -> Option<IdePackageJson> 
                 .any(|e| e == "*" || e == "onStartupFinished")
         });
 
-    let post_install_script = doc.get("scripts").and_then(Value::as_object).is_some_and(|s| {
-        s.contains_key("postinstall") || s.contains_key("install")
-    });
+    let post_install_script = doc
+        .get("scripts")
+        .and_then(Value::as_object)
+        .is_some_and(|s| s.contains_key("postinstall") || s.contains_key("install"));
 
-    let dep_count =
-        doc.get("dependencies")
-            .and_then(Value::as_object)
-            .map_or(0, |m| u32::try_from(m.len()).unwrap_or(0))
-        + doc.get("extensionDependencies")
+    let dep_count = doc
+        .get("dependencies")
+        .and_then(Value::as_object)
+        .map_or(0, |m| u32::try_from(m.len()).unwrap_or(0))
+        + doc
+            .get("extensionDependencies")
             .and_then(Value::as_array)
             .map_or(0, |a| u32::try_from(a.len()).unwrap_or(0));
 
@@ -1623,5 +1798,124 @@ mod tests {
     fn prefs_ack_prompt_count_zero_does_not_set_acknowledged() {
         let obj = serde_json::json!({"ack_prompt_count": 0});
         assert!(!parse_single_prefs(&obj).acknowledged);
+    }
+
+    // --- deduplicate_software ------------------------------------------------
+    //
+    // The rule mirrors ComplianceApp's behaviour:
+    //   - Same (context, publisher, display_name, version, software_code) ⇒ same entity.
+    //   - When duplicated, prefer the row where system_component == false.
+    //   - Otherwise, keep the first one seen (insertion order is stable).
+    //
+    // These tests exercise the rule in isolation — no registry access, no Win32.
+
+    fn row(
+        context: &str,
+        publisher: &str,
+        display_name: &str,
+        version: &str,
+        software_code: &str,
+        system_component: bool,
+    ) -> Value {
+        serde_json::json!({
+            "context":          context,
+            "publisher":        publisher,
+            "display_name":     display_name,
+            "version":          version,
+            "software_code":    software_code,
+            "system_component": system_component,
+        })
+    }
+
+    #[test]
+    fn dedup_prefers_non_system_component_on_collision() {
+        // Same key, system_component differs ⇒ the false-flagged one wins.
+        let sys = row("Machine", "Acme", "Foo", "1.0", "{GUID}", true);
+        let user = row("Machine", "Acme", "Foo", "1.0", "{GUID}", false);
+
+        // Try both orders: outcome must be identical because the rule is
+        // "non-system wins" regardless of which one was seen first.
+        let out_a = deduplicate_software(vec![sys.clone(), user.clone()]);
+        let out_b = deduplicate_software(vec![user.clone(), sys.clone()]);
+
+        assert_eq!(out_a.len(), 1);
+        assert_eq!(out_b.len(), 1);
+        assert_eq!(out_a[0]["system_component"], Value::Bool(false));
+        assert_eq!(out_b[0]["system_component"], Value::Bool(false));
+    }
+
+    #[test]
+    fn dedup_distinct_keys_all_kept() {
+        // Different software_code ⇒ distinct entities, both kept.
+        let a = row("Machine", "Acme", "Foo", "1.0", "{GUID-A}", false);
+        let b = row("Machine", "Acme", "Foo", "1.0", "{GUID-B}", false);
+
+        let out = deduplicate_software(vec![a, b]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn dedup_same_flag_preserves_first_seen() {
+        // Same key, both system_component == true ⇒ keep the first, drop the second.
+        let first = row("Machine", "Acme", "Foo", "1.0", "{GUID}", true);
+        let mut second = row("Machine", "Acme", "Foo", "1.0", "{GUID}", true);
+        // Sentinel field to distinguish the two rows beyond their dedup key.
+        second["sentinel"] = Value::String("second".into());
+
+        let out = deduplicate_software(vec![first, second]);
+        assert_eq!(out.len(), 1);
+        // The kept row is the first one ⇒ no `sentinel` field.
+        assert!(out[0].get("sentinel").is_none());
+    }
+
+    #[test]
+    fn dedup_both_non_system_preserves_first_seen() {
+        // Symmetric case to the previous one: both system_component == false
+        // ⇒ keep the first, drop the second.  The "non-system wins" rule does
+        // not flip behaviour when neither row is a system component.
+        let first = row("Machine", "Acme", "Foo", "1.0", "{GUID}", false);
+        let mut second = row("Machine", "Acme", "Foo", "1.0", "{GUID}", false);
+        second["sentinel"] = Value::String("second".into());
+
+        let out = deduplicate_software(vec![first, second]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].get("sentinel").is_none());
+    }
+
+    #[test]
+    fn dedup_context_distinguishes_machine_from_user() {
+        // Same software in Machine vs per-user SID context ⇒ both kept,
+        // because `context` is part of the dedup key.
+        let machine = row("Machine", "Acme", "Foo", "1.0", "{GUID}", false);
+        let user = row("S-1-5-21-…", "Acme", "Foo", "1.0", "{GUID}", false);
+
+        let out = deduplicate_software(vec![machine, user]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn dedup_weak_identity_rows_never_collapse() {
+        // Two rows with the same display_name but ALL optional fields
+        // empty — without the strong-identifier guard they would map to
+        // `(Machine, "", "Foo", "", "")` and collapse into one, dropping
+        // genuinely distinct data.  The guard keeps both.
+        let a = row("Machine", "", "Foo", "", "", false);
+        let b = row("Machine", "", "Foo", "", "", false);
+
+        let out = deduplicate_software(vec![a, b]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn dedup_partial_identity_still_collapses() {
+        // Symmetric sanity check: a single non-empty optional field is
+        // enough to pass the strong-identifier guard, so the normal
+        // dedup rule applies.  Here only `version` is non-empty.
+        let a = row("Machine", "", "Foo", "1.0", "", true);
+        let b = row("Machine", "", "Foo", "1.0", "", false);
+
+        let out = deduplicate_software(vec![a, b]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["system_component"], Value::Bool(false));
     }
 }

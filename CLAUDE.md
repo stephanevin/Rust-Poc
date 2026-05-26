@@ -74,7 +74,7 @@ structure of `sdh-fleet-client`:
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 45 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 51 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software, system updates). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
 | **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
@@ -218,7 +218,7 @@ rust-poc-lua/src/
 ├── lib.rs          # Public API + non-Windows stub
 ├── runtime.rs      # InternalRuntime::run — async, tokio::spawn_blocking + timeout
 ├── sandbox.rs      # Strips io/dofile/require/etc. globals
-├── host.rs         # 45 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── host.rs         # 51 `host.*` bindings + HostState (Rc<RefCell<..>>)
 ├── wmi.rs          # COMLibrary + WMIConnection + per-class cache
 ├── registry.rs     # RegOpenKeyExW + RegQueryValueExW + REG_* decode
 ├── net.rs          # GetAdaptersAddresses + IPv4 enumeration
@@ -226,10 +226,11 @@ rust-poc-lua/src/
 ├── adcomputer.rs   # GetComputerObjectNameW + DsGetSiteNameW + GetUserNameExW — 5 AD attrs (deviation #7, not in upstream)
 ├── winver.rs       # RtlGetVersion + GetFirmwareType
 ├── eventlog.rs     # Install date (registry-derived ISO 8601)
+├── updates.rs      # WUA COM bindings (IUpdateSession3, ISystemInformation, …) + WMI Root\ccm — deviations #26–#31
 └── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 45 `host.*` bindings exposed to Lua
+### The 51 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -277,6 +278,12 @@ rust-poc-lua/src/
 | `host.os_services()` **(deviation #23)** | Win32 SC Manager APIs (`OpenSCManagerW` + `EnumServicesStatusExW` + `QueryServiceConfigW` + `QueryServiceConfig2W`) instead of WMI `Win32_Service` — lower overhead, no COM marshalling; mirrors `OSServices.cs` | `array<{display_name, start_mode, delayed_auto_start, state, start_name, path_name, name}>?` |
 | `host.browser_extensions_installed()` **(deviation #24)** | Chromium `Preferences` + `Secure Preferences` parsed as `ChromiumPreferencesParser`; 7 browsers (Edge, Chrome, Brave, Vivaldi, Arc, Opera, Opera GX); `_locales/en/messages.json` NLS resolution; mirrors `BrowserExtensionsInstalled.cs` + `ChromiumPreferencesParser.cs` | `array<{browser, sid, user_profile, …28 fields}>` |
 | `host.ide_extensions_installed()` **(deviation #25)** | VS Code-family (VSCode, Insiders, Cursor, Windsurf, VSCodium, Antigravity); `extensions.json` registry + `package.json` + `package.nls*.json` NLS resolution; mirrors `IdeExtensionsInstalled.cs` | `array<{ide, sid, user_profile, …18 fields}>` |
+| `host.updates_is_managed()` **(deviation #26)** | WUA COM `IUpdateServiceManager2::Services` → `IsDefaultAUService` → `IsManaged`; mirrors `UpdatesIsManaged.cs`; shares `HostState::au_service` cache with #27 | `"Managed" \| "Unmanaged" \| nil` |
+| `host.updates_managed_by()` **(deviation #27)** | WUA COM `IUpdateServiceManager2::Services` → `IsDefaultAUService` → `Name`; mirrors `UpdatesManagedBy.cs`; shares `HostState::au_service` cache with #26 | `string?` |
+| `host.updates_reboot_required()` **(deviation #28)** | WUA COM `ISystemInformation::RebootRequired`; mirrors `UpdatesRebootRequired.cs` | `bool?` |
+| `host.updates_reboot_required_before_installation()` **(deviation #29)** | WUA COM `IUpdateInstaller::RebootRequiredBeforeInstallation`; mirrors `UpdatesRebootRequiredBeforeInstallation.cs` | `bool?` |
+| `host.updates_windows_updates()` **(deviation #30)** | WUA COM `IUpdateSession3` → `IUpdateSearcher3` offline search (`"IsInstalled=1 OR IsInstalled=0"`); mirrors `UpdatesWindowsUpdates.cs`; no 90 s timeout thread; shares `HostState::updates_cache` with #31 (one offline search, two consumers) | `array<{title, article_ids, category, update_id, …20 fields}>?` |
+| `host.updates_sccm_updates()` **(deviation #31)** | WMI `Root\ccm\SoftwareUpdates\DeploymentAgent::CCM_TargetedUpdateEx1` joined in-memory against the shared `HostState::updates_cache` index (no second offline search); mirrors `UpdatesSccmUpdates.cs`; returns `[]` when no SCCM agent (`WBEM_E_INVALID_NAMESPACE`) | `array<{update_id, title, article_ids, installed, …11 fields}>` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -314,7 +321,7 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **eight** points where copying upstream byte-for-byte
+There are exactly **fourteen** points where copying upstream byte-for-byte
 would not compile or would not match the surface this PoC needs to
 expose. Each one is documented inline at the touch site so a future
 re-sync is mechanical.
@@ -422,6 +429,50 @@ re-sync is mechanical.
    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve
    `bind_chassis_type`, `bind_virtual_machine`, `chassis_type_str`, and
    their calls inside `install_composites`.
+
+9. **`rust-poc-lua/src/updates.rs` + `install_updates_bindings` in
+   `host.rs` — six System Updates bindings.**
+   Not in upstream. Uses WUA COM interfaces directly (`IUpdateServiceManager2`,
+   `ISystemInformation`, `IUpdateInstaller`, `IUpdateSession3`) matching the
+   ComplianceApp implementation. Requires feature `Win32_System_UpdateAgent` in
+   `rust-poc-lua/Cargo.toml`.
+   - `host.updates_is_managed()` — déviation #26. Returns `"Managed"` /
+     `"Unmanaged"` / `nil`. Type differs from the C# `UpdateManagementState` enum.
+   - `host.updates_managed_by()` — déviation #27. Name of default AU service.
+   - `host.updates_reboot_required()` — déviation #28. `ISystemInformation::RebootRequired`.
+   - `host.updates_reboot_required_before_installation()` — déviation #29.
+     `IUpdateInstaller::RebootRequiredBeforeInstallation`.
+   - `host.updates_windows_updates()` — déviation #30. Faithful offline WUA
+     search; no 90 s `CancellationToken` timeout thread (synchronous; `spawn_blocking`
+     provides isolation).
+   - `host.updates_sccm_updates()` — déviation #31. WMI `Root\ccm` + WUA
+     offline bulk search for in-memory join (no N individual searches). Returns
+     `[]` when SCCM agent is absent (`WBEM_E_INVALID_NAMESPACE`); propagates any
+     other WMI/CCM failure into `host.errors()`.
+
+   **Per-run caches on `HostState`** — two lazy-init fields mirror the
+   existing `wmi: Option<Wmi>` pattern, both shaped as tri-state enums
+   so init failures are memoised (no expensive retry) and surfaced
+   under a single canonical error key:
+   - `updates_cache: UpdatesCacheState` (`NotInit | Ready(UpdatesCache)
+     | Failed`) — one offline WUA search builds both the full update
+     list (#30) and the `UpdateID → WuaMeta` join index (#31).  Halves
+     the most expensive call when both bindings are consumed in the
+     same run.  Init failures are recorded once under the canonical key
+     `ERR_KEY_WUA_CACHE_INIT = "updates:wua_cache_init"`; SCCM rows
+     still come through with `null` enrichment.
+   - `au_service: AuServiceState` (`NotInit | Ready(Option<(bool,
+     String)>) | Failed`) — one `IUpdateServiceManager2::Services`
+     enumeration feeds both #26 and #27.  The inner `Option` of `Ready`
+     distinguishes "no default AU service registered" (`Ready(None)`)
+     from "service found" (`Ready(Some((managed, name)))`).  Init
+     failures are recorded once under
+     `ERR_KEY_AU_SERVICE = "updates:au_service"`.
+
+   Re-sync impact: `Copy-Item` of `host.rs` MUST preserve `updates.rs`,
+   the `install_updates_bindings` call, both `HostState` cache fields,
+   their tri-state enums, and their accessor methods
+   (`ensure_updates_cache()`, `ensure_au_service()`).
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is
