@@ -11,8 +11,8 @@ use std::os::windows::ffi::OsStringExt;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, REG_DWORD, REG_EXPAND_SZ,
-    REG_MULTI_SZ, REG_QWORD, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
-    RegQueryValueExW,
+    REG_MULTI_SZ, REG_QWORD, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegEnumKeyExW, RegEnumValueW,
+    RegOpenKeyExW, RegQueryValueExW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
@@ -165,6 +165,153 @@ pub(super) fn try_subkey_names(hive: &str, key: &str) -> Result<Vec<String>, Str
     Ok(names)
 }
 
+/// Returns the names of every direct value under `key` in `hive`.
+///
+/// Mirrors [`subkey_names`] but for value-name enumeration via
+/// `RegEnumValueW`.  Used by `bitlocker::policy_state` to detect whether
+/// any of the eight FVE enforcement values are present under
+/// `HKLM\SOFTWARE\Policies\Microsoft\FVE` — the same test that
+/// `BitLocker.cs::GetFVEStatus` performs in `ComplianceApp` via
+/// `RegistryKey.GetValueNames()`.
+///
+/// Returns `Ok(vec![])` when the key is absent (normal "no policy
+/// configured" case) and `Err(_)` for any other Win32 failure
+/// (access denied, registry corruption, …) — same calling contract
+/// as [`try_subkey_names`].
+pub(super) fn enum_value_names(hive: &str, key: &str) -> Result<Vec<String>, String> {
+    let root: HKEY = match hive {
+        "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
+        "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
+        "HKU" | "HKEY_USERS" => HKEY_USERS,
+        other => return Err(format!("unsupported hive: {other}")),
+    };
+
+    let mut hkey = HKEY::default();
+    let key_w: HSTRING = key.into();
+    // SAFETY: HSTRING outlives the call; KEY_READ is non-destructive.
+    let r = unsafe { RegOpenKeyExW(root, PCWSTR(key_w.as_ptr()), None, KEY_READ, &mut hkey) };
+    if r == ERROR_FILE_NOT_FOUND || r == ERROR_PATH_NOT_FOUND {
+        return Ok(Vec::new());
+    }
+    if r.is_err() {
+        return Err(format!(
+            "RegOpenKeyExW({hive}\\{key}) failed with WIN32_ERROR({})",
+            r.0
+        ));
+    }
+
+    let mut names = Vec::new();
+    // Registry value names are at most 16383 chars per MSDN — sized to a
+    // comfortable 1024 (FVE policy uses ≤ 32-char names; same upper bound
+    // as the equivalent `RegistryKey.GetValueNames` allocation in .NET).
+    let mut name_buf = vec![0u16; 1024];
+    let buf_capacity: u32 = 1024;
+    for idx in 0_u32.. {
+        let mut name_len = buf_capacity;
+        // SAFETY: hkey is valid; name_buf outlives the call; name_len is
+        // passed by reference so the API cannot overflow.
+        let r = unsafe {
+            RegEnumValueW(
+                hkey,
+                idx,
+                Some(PWSTR(name_buf.as_mut_ptr())),
+                &mut name_len,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if r.is_err() {
+            // ERROR_NO_MORE_ITEMS (259) at end-of-iteration; any other
+            // error is benign at this stage — we already returned the
+            // names we successfully enumerated.
+            break;
+        }
+        let name = OsString::from_wide(&name_buf[..name_len as usize])
+            .to_string_lossy()
+            .into_owned();
+        names.push(name);
+    }
+
+    // SAFETY: hkey opened by RegOpenKeyExW; RegCloseKey never fails.
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    Ok(names)
+}
+
+/// Reads a `REG_BINARY` (or any) value as raw bytes.
+///
+/// Used by `bitlocker::recovery_key_rotation_executed` to read the
+/// 8-byte `FILETIME` stored as `REG_BINARY` under
+/// `HKLM\SYSTEM\CurrentControlSet\Control\Windows\ShutdownTime` — the
+/// same value the C# helper `LastKeyRotationEvent` reads via
+/// `RegistryKey.GetValue(...) is byte[]`.
+///
+/// Returns `None` when the key or value is absent; returns the raw
+/// byte buffer otherwise (regardless of registry type).
+pub(super) fn read_binary(hive: &str, key: &str, value: &str) -> Option<Vec<u8>> {
+    let root: HKEY = match hive {
+        "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
+        "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
+        "HKU" | "HKEY_USERS" => HKEY_USERS,
+        _ => return None,
+    };
+
+    let mut hkey = HKEY::default();
+    let key_w: HSTRING = key.into();
+    // SAFETY: HSTRING outlives the call.
+    let r = unsafe { RegOpenKeyExW(root, PCWSTR(key_w.as_ptr()), None, KEY_READ, &mut hkey) };
+    if r.is_err() {
+        return None;
+    }
+
+    let value_w: HSTRING = value.into();
+    let mut value_type = REG_VALUE_TYPE::default();
+    let mut data_size: u32 = 0;
+    // SAFETY: probe call with buffer=None to learn the size.
+    let r = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(value_w.as_ptr()),
+            None,
+            Some(&mut value_type),
+            None,
+            Some(&mut data_size),
+        )
+    };
+    if r.is_err() || data_size == 0 {
+        // SAFETY: handle was opened above.
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+        return None;
+    }
+
+    let mut buf = vec![0u8; data_size as usize];
+    // SAFETY: buf has data_size bytes; the API writes at most that many.
+    let r = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(value_w.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some(buf.as_mut_ptr()),
+            Some(&mut data_size),
+        )
+    };
+    // SAFETY: handle opened above; closing is the documented contract.
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    if r.is_err() {
+        return None;
+    }
+    buf.truncate(data_size as usize);
+    Some(buf)
+}
+
 fn decode(t: REG_VALUE_TYPE, buf: &[u8]) -> Option<Value> {
     match t {
         REG_SZ | REG_EXPAND_SZ => Some(Value::String(utf16_to_string(buf))),
@@ -204,7 +351,7 @@ fn utf16_to_string(buf: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::try_subkey_names;
+    use super::{enum_value_names, try_subkey_names};
 
     /// `HKLM\SOFTWARE` exists on every Windows install and has many
     /// subkeys — happy path.
@@ -236,6 +383,38 @@ mod tests {
     #[test]
     fn try_subkey_names_unsupported_hive_returns_err() {
         let result = try_subkey_names("BOGUS_HIVE", "anything");
+        assert!(matches!(result, Err(ref msg) if msg.contains("BOGUS_HIVE")));
+    }
+
+    /// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion` is present on
+    /// every Windows install and exposes well-known values such as
+    /// `CurrentBuild`, `ProductName`, `EditionID` — happy path for
+    /// `enum_value_names`.
+    #[test]
+    fn enum_value_names_returns_non_empty_for_well_known_key() {
+        let Ok(names) = enum_value_names("HKLM", r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+        else {
+            panic!("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion must open");
+        };
+        assert!(
+            !names.is_empty(),
+            "CurrentVersion always has values (ProductName, CurrentBuild, …)"
+        );
+    }
+
+    /// Absent key collapses to `Ok(vec![])` — mirrors the
+    /// `try_subkey_names_absent_key_returns_empty_ok` contract.
+    #[test]
+    fn enum_value_names_absent_key_returns_empty_ok() {
+        let result =
+            enum_value_names("HKLM", r"SOFTWARE\This-Key-Does-Not-Exist-rust-poc-fvepolicy-9876");
+        assert_eq!(result, Ok(Vec::new()));
+    }
+
+    /// Unsupported hive → diagnostic Err, not silent empty.
+    #[test]
+    fn enum_value_names_unsupported_hive_returns_err() {
+        let result = enum_value_names("BOGUS_HIVE", "anything");
         assert!(matches!(result, Err(ref msg) if msg.contains("BOGUS_HIVE")));
     }
 }

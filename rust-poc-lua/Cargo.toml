@@ -6,6 +6,11 @@ description = "In-process Lua 5.4 collector runtime + host bindings (Windows-onl
 publish = false
 
 [dependencies]
+# `serde` derive macros are used directly by `bitlocker.rs` and
+# `credentialguard.rs` to define typed in/out structs for
+# `WMIConnection::exec_instance_method`.  Other modules go through
+# `serde_json::Value` and don't need the derive crate.
+serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror  = "2"
 # `fs` added vs sdh-fleet-client/lua/Cargo.toml: runtime.rs uses
@@ -42,6 +47,7 @@ windows = { version = "0.62", features = [
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",               # BCryptEnumContextFunctions + BCryptFreeBuffer
     "Win32_Globalization",                        # GetUser/SystemDefaultUILanguage, GetUser/SystemDefaultLocaleName, LCIDToLocaleName
+    "Win32_System_EventLog",                  # EvtQuery, EvtNext, EvtRender, EvtClose — BitLocker recovery-key event log
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",                  # OpenSCManagerW, EnumServicesStatusExW, SC_HANDLE
     "Win32_System_UpdateAgent",               # WUA COM: IUpdateSession3, IUpdateSearcher3, ISystemInformation, IUpdateInstaller, IUpdateServiceManager2, IAutomaticUpdates2

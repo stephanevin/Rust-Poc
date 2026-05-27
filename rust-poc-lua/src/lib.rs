@@ -1,4 +1,4 @@
-//! In-process Lua 5.4 collector runtime + 51 `host.*` bindings.
+//! In-process Lua 5.4 collector runtime + 58 `host.*` bindings.
 //!
 //! This crate is **Windows-only** (real impl). On every other target
 //! (Linux dev/CI, macOS until macOS host bindings exist) it compiles to
@@ -30,8 +30,14 @@ pub struct LuaError(pub String);
 
 #[cfg(windows)]
 mod ad;
+// `setup_history` is the deviation #16 module — renamed from the upstream
+// `eventlog.rs`, which never actually touched the Event Log API (it only
+// reads `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion` and the
+// `HKLM\SYSTEM\Setup\Source OS *` subkeys to derive `install_date`).  The
+// real Event Log wrapper lives in `evt.rs` (deviation #10); keeping the
+// old name would conflate the two modules.
 #[cfg(windows)]
-mod eventlog;
+mod setup_history;
 #[cfg(windows)]
 mod host;
 // `hostname` is the deviation #6 module — added on top of the verbatim
@@ -98,6 +104,23 @@ mod software;
 // for SCCM-targeted updates. Deviations #26–#31.
 #[cfg(windows)]
 mod updates;
+// `evt` is the Windows Event Log wrapper (EvtQuery + EvtRender) feeding
+// `bitlocker.rs` recovery-key event queries (events 783, 845, 864, 775).
+// Deviation #32.
+#[cfg(windows)]
+mod evt;
+// `bitlocker` exposes the six BitLocker host bindings (volume status via
+// Win32_EncryptableVolume + GetConversionStatus, key protector IDs and
+// DRA thumbprints via WMI ExecMethod, FVE policy via registry value
+// enumeration, recovery-key escrow + rotation via the BitLocker event
+// log). Deviations #33–#37.
+#[cfg(windows)]
+mod bitlocker;
+// `credentialguard` exposes the single host.credential_guard_status()
+// binding, reading Win32_DeviceGuard from root\Microsoft\Windows\DeviceGuard
+// and deriving two convenience booleans. Deviation #38.
+#[cfg(windows)]
+mod credentialguard;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

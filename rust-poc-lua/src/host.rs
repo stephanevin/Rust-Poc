@@ -16,7 +16,8 @@ use mlua::{
 };
 
 use super::{
-    accounts, ad, gpo, net, regional, registry, software, tls, updates, winver, wmi::Wmi, wnf, wts,
+    accounts, ad, bitlocker, credentialguard, gpo, net, regional, registry, software, tls, updates,
+    winver, wmi::Wmi, wnf, wts,
 };
 
 /// Canonical `host.errors()` key for any failure of
@@ -89,10 +90,17 @@ pub(super) struct HostState {
     pub perimeter: Option<String>,
     pub wmi: Option<Wmi>,
     /// One-shot cache of the WUA offline payload, populated lazily on the
-    /// first `host.updates_windows_updates()` or `host.updates_sccm_updates()`
-    /// call.  Mirrors the `wmi: Option<Wmi>` pattern above — one offline
-    /// search instead of two, shared by both bindings.  Init failures are
-    /// memoised (`Failed`) so subsequent bindings short-circuit.
+    /// first `host.updates_windows_updates()` call.  Mirrors the
+    /// `wmi: Option<Wmi>` pattern above — the offline search is the
+    /// heaviest call in the System Updates group (~1-2 s on 500+
+    /// updates) and would be re-run on every consumer call without
+    /// memoisation.  Init failures are memoised (`Failed`) so the
+    /// expensive call is never retried within the same run.
+    ///
+    /// Note: before the SCCM #31 refactor this cache also fed
+    /// `host.updates_sccm_updates()`.  The new SCCM pipeline is
+    /// source-independent (`CCM_UpdateStatus` pivot + WUA online
+    /// `QueryHistory`) so #30 is now the sole consumer.
     pub updates_cache: UpdatesCacheState,
     /// Cache of the default Automatic Updates service lookup, populated
     /// lazily on the first `host.updates_is_managed()` or
@@ -155,17 +163,17 @@ impl HostState {
             .ok_or_else(|| "wmi: unreachable — initialized above".to_string())
     }
 
-    /// Lazy-init accessor for the shared WUA offline payload.
+    /// Lazy-init accessor for the WUA offline payload.
     ///
     /// First call performs the expensive offline search and stores the
     /// payload; subsequent calls hand out the cached value.  On failure,
     /// the state moves to [`UpdatesCacheState::Failed`] (no retry) and a
     /// single canonical diagnostic is recorded under
-    /// [`ERR_KEY_WUA_CACHE_INIT`] — both `updates_windows_updates` and
-    /// `updates_sccm_updates` surface the same key regardless of which
-    /// one triggered the init.  Returns `None` for both `NotInit` (post-
-    /// failure path: should never happen, we just transitioned to
-    /// `Failed`) and `Failed`.
+    /// [`ERR_KEY_WUA_CACHE_INIT`] — only `updates_windows_updates`
+    /// surfaces this key today (since the SCCM #31 refactor, that path
+    /// no longer touches the offline cache).  Returns `None` for both
+    /// `NotInit` (post-failure path: should never happen, we just
+    /// transitioned to `Failed`) and `Failed`.
     fn ensure_updates_cache(&mut self) -> Option<&updates::UpdatesCache> {
         if matches!(self.updates_cache, UpdatesCacheState::NotInit) {
             match updates::build_offline_payload() {
@@ -274,6 +282,7 @@ pub(super) fn install(
     install_accounts_bindings(lua, &host, &state)?;
     install_software_bindings(lua, &host, &state)?;
     install_updates_bindings(lua, &host, &state)?;
+    install_hardening_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -308,7 +317,7 @@ fn install_scalars(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
     host.set(
         "now_iso8601",
         lua.create_function(|lua, ()| {
-            let v = &super::eventlog::install_info()["install_date"];
+            let v = &super::setup_history::install_info()["install_date"];
             lua.to_value(v)
         })?,
     )?;
@@ -580,7 +589,7 @@ fn install_ad_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()
 fn install_setup_history(lua: &Lua, host: &Table) -> LuaResult<()> {
     host.set(
         "setup_history",
-        lua.create_function(|lua, ()| lua.to_value(&super::eventlog::install_info()))?,
+        lua.create_function(|lua, ()| lua.to_value(&super::setup_history::install_info()))?,
     )?;
 
     Ok(())
@@ -1119,20 +1128,18 @@ fn install_updates_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResu
         )?;
     }
 
-    // host.updates_sccm_updates() — WMI Root\ccm + WUA offline join.
-    // Mirrors UpdatesSccmUpdates.cs. Returns [] when no SCCM agent. Deviation #31.
+    // host.updates_sccm_updates() — quad-source merge faithful to
+    // Updates.cs::GetSccmUpdates (deviation #31). DTO is strict 1:1 with
+    // SccmUpdate.cs.  No longer shares the `updates_cache` with #30 — the
+    // SCCM path runs its own CCM_UpdateStatus pivot + WUA online
+    // QueryHistory.
     {
         let s = state.clone();
         host.set(
             "updates_sccm_updates",
             lua.create_function(move |lua, ()| {
                 let mut st = s.borrow_mut();
-                // Trigger cache init; on failure, the canonical diagnostic
-                // `ERR_KEY_WUA_CACHE_INIT` is already recorded by
-                // ensure_updates_cache and we proceed without enrichment —
-                // the SCCM rows still come through (fix #2: best-effort).
-                let result =
-                    updates::updates_sccm_updates(st.ensure_updates_cache().map(|c| &c.index));
+                let result = updates::updates_sccm_updates();
                 match result {
                     Ok(rows) => {
                         let value = serde_json::Value::Array(rows);
@@ -1155,6 +1162,202 @@ fn install_updates_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResu
     Ok(())
 }
 
+// --- Hardening (BitLocker + Credential Guard) -------------------------
+//
+// Deviations #32 – #38 (see CLAUDE.md):
+// - #32: evt.rs — Windows Event Log wrapper (EvtQuery + EvtRender) used
+//        by BitLocker recovery-key event queries.
+// - #33: host.bitlocker_volume_status(mount_point)
+// - #34: host.bitlocker_key_protector_ids(mount_point, protector_type)
+// - #35: host.bitlocker_dra_thumbprints(mount_point)
+// - #36: host.bitlocker_policy()
+// - #37: host.bitlocker_escrowed_protector_ids(event_id)
+//        + host.bitlocker_recovery_key_rotation_executed()
+// - #38: host.credential_guard_status()
+//
+// All seven bindings respect the workspace contract: never raise, record
+// failures into host.errors(), return nil on failure.
+#[allow(clippy::too_many_lines)]
+fn install_hardening_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.bitlocker_volume_status(mount_point) — Win32_EncryptableVolume
+    // + GetConversionStatus.  Mirrors `BitlockerStatus` + `BitLockerEncryptionPercentage`.
+    {
+        let s = state.clone();
+        host.set(
+            "bitlocker_volume_status",
+            lua.create_function(move |lua, mount_point: String| {
+                let mut st = s.borrow_mut();
+                let field = format!("bitlocker_volume_status:{mount_point}");
+                let res = match st.wmi() {
+                    Ok(wmi) => bitlocker::volume_status(wmi, &mount_point),
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Ok(Some(v)) => Ok(lua_to_value_or_nil(lua, &mut st, &field, &v)),
+                    Ok(None) => Ok(Value::Nil),
+                    Err(e) => {
+                        st.record_error(&field, e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.bitlocker_key_protector_ids(mount_point, protector_type)
+    // — GetKeyProtectors method.  protector_type: 3=NumericPassword, 7=PublicKey/DRA.
+    {
+        let s = state.clone();
+        host.set(
+            "bitlocker_key_protector_ids",
+            lua.create_function(
+                move |lua, (mount_point, protector_type): (String, u32)| {
+                    let mut st = s.borrow_mut();
+                    let field =
+                        format!("bitlocker_key_protector_ids:{mount_point}:{protector_type}");
+                    let res = match st.wmi() {
+                        Ok(wmi) => bitlocker::key_protector_ids(wmi, &mount_point, protector_type),
+                        Err(e) => Err(e),
+                    };
+                    match res {
+                        Ok(ids) => {
+                            let arr: Vec<serde_json::Value> =
+                                ids.into_iter().map(serde_json::Value::String).collect();
+                            let value = serde_json::Value::Array(arr);
+                            Ok(lua_to_value_or_nil(lua, &mut st, &field, &value))
+                        }
+                        Err(e) => {
+                            st.record_error(&field, e);
+                            Ok(Value::Nil)
+                        }
+                    }
+                },
+            )?,
+        )?;
+    }
+
+    // host.bitlocker_dra_thumbprints(mount_point) — GetKeyProtectors(7) + GetKeyProtectorCertificate.
+    // Mirrors `BitLockerDRACertThumbPrints`.
+    {
+        let s = state.clone();
+        host.set(
+            "bitlocker_dra_thumbprints",
+            lua.create_function(move |lua, mount_point: String| {
+                let mut st = s.borrow_mut();
+                let field = format!("bitlocker_dra_thumbprints:{mount_point}");
+                let res = match st.wmi() {
+                    Ok(wmi) => bitlocker::dra_thumbprints(wmi, &mount_point),
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Ok(thumbs) => {
+                        let arr: Vec<serde_json::Value> =
+                            thumbs.into_iter().map(serde_json::Value::String).collect();
+                        let value = serde_json::Value::Array(arr);
+                        Ok(lua_to_value_or_nil(lua, &mut st, &field, &value))
+                    }
+                    Err(e) => {
+                        st.record_error(&field, e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.bitlocker_policy() — `HKLM\SOFTWARE\Policies\Microsoft\FVE` value names.
+    // Mirrors `BitLockerPolicy`.
+    {
+        let s = state.clone();
+        host.set(
+            "bitlocker_policy",
+            lua.create_function(move |_, ()| {
+                let mut st = s.borrow_mut();
+                match bitlocker::policy_state() {
+                    Ok(label) => Ok(Some(label.to_string())),
+                    Err(e) => {
+                        st.record_error("bitlocker_policy", e);
+                        Ok(None)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.bitlocker_escrowed_protector_ids(event_id) — BitLocker Management channel.
+    // Mirrors `BitLockerRecoveryKeyADBackupSummary` (id=783) + `BitLockerRecoveryKeyAzureADBackupSummary` (id=845).
+    {
+        let s = state.clone();
+        host.set(
+            "bitlocker_escrowed_protector_ids",
+            lua.create_function(move |lua, event_id: u32| {
+                let mut st = s.borrow_mut();
+                let field = format!("bitlocker_escrowed_protector_ids:{event_id}");
+                match bitlocker::escrowed_protector_ids(event_id) {
+                    Ok(ids) => {
+                        let arr: Vec<serde_json::Value> =
+                            ids.into_iter().map(serde_json::Value::String).collect();
+                        let value = serde_json::Value::Array(arr);
+                        Ok(lua_to_value_or_nil(lua, &mut st, &field, &value))
+                    }
+                    Err(e) => {
+                        st.record_error(&field, e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.bitlocker_recovery_key_rotation_executed() — ShutdownTime + events 864/775.
+    // Mirrors `BitLockerService.RecoveryKeyRotationFromEventsExecuted`.
+    // Three-state: nil = never rotated, true = rotation executed, false = pending.
+    {
+        let s = state.clone();
+        host.set(
+            "bitlocker_recovery_key_rotation_executed",
+            lua.create_function(move |_, ()| {
+                let mut st = s.borrow_mut();
+                match bitlocker::recovery_key_rotation_executed() {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        st.record_error("bitlocker_recovery_key_rotation_executed", e);
+                        Ok(None)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.credential_guard_status() — Win32_DeviceGuard in root\Microsoft\Windows\DeviceGuard.
+    // Mirrors `CredentialGuardStatus.Create` from `ComplianceApp.Shared`.
+    {
+        let s = state.clone();
+        host.set(
+            "credential_guard_status",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                let res = match st.wmi() {
+                    Ok(wmi) => credentialguard::status(wmi),
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Ok(Some(v)) => {
+                        Ok(lua_to_value_or_nil(lua, &mut st, "credential_guard_status", &v))
+                    }
+                    Ok(None) => Ok(Value::Nil),
+                    Err(e) => {
+                        st.record_error("credential_guard_status", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    Ok(())
+}
+
 // --- Convenience composites (keep the Lua script lean) ----------------
 
 fn install_composites(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
@@ -1166,6 +1369,7 @@ fn install_composites(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()>
     bind_desktop_resolution(lua, host, state)?;
     bind_chassis_type(lua, host, state)?;
     bind_virtual_machine(lua, host, state)?;
+    bind_virtualization_capability(lua, host, state)?;
     bind_terminal_sessions(lua, host, state)?;
     Ok(())
 }
@@ -1545,6 +1749,91 @@ fn detect_virtual_machine(st: &mut HostState) -> bool {
     false
 }
 
+/// Exposes `host.virtualization_capability()` → `bool?`.
+///
+/// Faithful Rust port of
+/// `ComplianceApp/DataTransformers/BIOS/Virtualization.cs`:
+///
+/// ```text
+/// (VMMonitorModeExtensions == Supported
+///  && VirtualizationFirmwareEnabled == Enabled)
+/// || HypervisorPresent == Present
+/// ```
+///
+/// Three WMI properties from two cached classes:
+/// - `Win32_Processor.VMMonitorModeExtensions` — CPU supports Intel
+///   VT-x / AMD-V virtualization extensions.
+/// - `Win32_Processor.VirtualizationFirmwareEnabled` — BIOS/UEFI has
+///   actually turned the extensions on (a CPU can support them while
+///   the firmware leaves them off).
+/// - `Win32_ComputerSystem.HypervisorPresent` — a hypervisor is
+///   running on this machine (either Hyper-V/VBS on the host, or this
+///   host is itself a guest VM).
+///
+/// **Semantic vs `host.virtual_machine()` — these answer two distinct
+/// questions:**
+///
+/// | Binding | Question | Backend |
+/// |---|---|---|
+/// | `host.virtual_machine()` | "Am I running INSIDE a VM?" | WMI `Win32_ComputerSystem.Model` + CPUID hypervisor-vendor leaf |
+/// | `host.virtualization_capability()` | "CAN this host do virtualization, and/or is it doing it already?" | WMI three-property formula above |
+///
+/// The latter is the precondition exposed by
+/// `Win10-Laptop.json → "Virtualization"` for VBS / Credential Guard /
+/// WSL2.  A physical laptop with Hyper-V hosting Credential Guard
+/// answers `false` to the first and `true` to the second; a guest VM
+/// answers `true` to both.
+///
+/// Missing WMI properties degrade to `false`, mirroring the C#
+/// nullable-state semantics (`nullable_enum == specific_value` is
+/// always `false` when the nullable is null).  Returns `nil` to Lua
+/// only on a hard WMI failure (COM init, namespace unreachable), at
+/// which point the failure is also recorded into `host.errors()`.
+fn bind_virtualization_capability(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        "virtualization_capability",
+        lua.create_function(move |_, ()| {
+            let mut st = s.borrow_mut();
+            match detect_virtualization_capability(&mut st) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) => {
+                    st.record_error("virtualization_capability", e);
+                    Ok::<Option<bool>, _>(None)
+                }
+            }
+        })?,
+    )
+}
+
+fn detect_virtualization_capability(st: &mut HostState) -> Result<bool, String> {
+    let wmi = st.wmi()?;
+    let vmm = wmi
+        .query_first("Win32_Processor", "VMMonitorModeExtensions")?
+        .and_then(|v| v.as_bool());
+    let firmware = wmi
+        .query_first("Win32_Processor", "VirtualizationFirmwareEnabled")?
+        .and_then(|v| v.as_bool());
+    let hypervisor = wmi
+        .query_first("Win32_ComputerSystem", "HypervisorPresent")?
+        .and_then(|v| v.as_bool());
+    Ok(compute_virtualization_capability(vmm, firmware, hypervisor))
+}
+
+/// Pure formula, extracted for unit testing without a live WMI stack.
+///
+/// Each `Option::unwrap_or(false)` is the Rust equivalent of the C#
+/// `nullable_enum_state == specific_state` comparison, which returns
+/// `false` when the nullable side is `null` — i.e. a missing WMI
+/// property never satisfies the formula by accident.
+fn compute_virtualization_capability(
+    vmm: Option<bool>,
+    firmware: Option<bool>,
+    hypervisor: Option<bool>,
+) -> bool {
+    (vmm.unwrap_or(false) && firmware.unwrap_or(false)) || hypervisor.unwrap_or(false)
+}
+
 /// Exposes `host.terminal_sessions()` → `array<{session_id, station_name, state, user, sid}> | nil`.
 ///
 /// Lists all WTS sessions on the local machine via `WTSEnumerateSessionsW` +
@@ -1597,4 +1886,95 @@ fn install_errors(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_virtualization_capability;
+
+    // Truth-table coverage for the `Virtualization.cs` formula.
+    //
+    // Each Option::unwrap_or(false) mirrors the C# nullable-enum vs
+    // specific-state `==` comparison, which is false on null.  The
+    // tests pin that semantic so a refactor of the formula cannot
+    // silently start returning true on missing WMI data.
+    #[test]
+    fn formula_false_when_all_inputs_are_none() {
+        assert!(!compute_virtualization_capability(None, None, None));
+    }
+
+    #[test]
+    fn formula_true_on_hypervisor_present_alone() {
+        // Common case on a Windows 11 laptop with VBS active: VBS itself
+        // forces HypervisorPresent=true regardless of firmware reporting.
+        assert!(compute_virtualization_capability(
+            Some(false),
+            Some(false),
+            Some(true)
+        ));
+    }
+
+    #[test]
+    fn formula_true_when_cpu_and_firmware_both_enabled() {
+        // Bare-metal machine with VT-x supported AND BIOS flag on,
+        // even if no hypervisor is loaded yet.
+        assert!(compute_virtualization_capability(
+            Some(true),
+            Some(true),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn formula_false_when_cpu_supports_but_firmware_off() {
+        // CPU is capable but the BIOS toggle is off and no hypervisor
+        // is running — explicitly a NOT-virtualization state in the
+        // ComplianceApp transformer.
+        assert!(!compute_virtualization_capability(
+            Some(true),
+            Some(false),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn formula_false_when_firmware_on_but_cpu_not_supported() {
+        assert!(!compute_virtualization_capability(
+            Some(false),
+            Some(true),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn formula_treats_missing_cpu_field_as_false_branch() {
+        // VMMonitorModeExtensions is null but VirtualizationFirmwareEnabled
+        // is true and hypervisor absent → no virtualization claimed.
+        // Mirrors `null == Supported` being false in C#.
+        assert!(!compute_virtualization_capability(
+            None,
+            Some(true),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn formula_missing_hypervisor_does_not_block_cpu_path() {
+        // CPU + firmware path is sufficient; missing hypervisor is fine.
+        assert!(compute_virtualization_capability(
+            Some(true),
+            Some(true),
+            None
+        ));
+    }
+
+    #[test]
+    fn formula_missing_cpu_path_does_not_block_hypervisor_path() {
+        // Either path is independently sufficient — hypervisor wins.
+        assert!(compute_virtualization_capability(
+            None,
+            None,
+            Some(true)
+        ));
+    }
 }

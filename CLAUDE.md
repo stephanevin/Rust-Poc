@@ -74,7 +74,7 @@ structure of `sdh-fleet-client`:
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 51 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software, system updates). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 58 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software, system updates, BitLocker, Credential Guard, Event Log). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
 | **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
@@ -215,27 +215,30 @@ intentional deviations from a strict `cp -r` are documented below.
 
 ```
 rust-poc-lua/src/
-├── lib.rs          # Public API + non-Windows stub
-├── runtime.rs      # InternalRuntime::run — async, tokio::spawn_blocking + timeout
-├── sandbox.rs      # Strips io/dofile/require/etc. globals
-├── host.rs         # 51 `host.*` bindings + HostState (Rc<RefCell<..>>)
-├── wmi.rs          # COMLibrary + WMIConnection + per-class cache
-├── registry.rs     # RegOpenKeyExW + RegQueryValueExW + REG_* decode
-├── net.rs          # GetAdaptersAddresses + IPv4 enumeration
-├── hostname.rs     # GetComputerNameExW — 3 variants (deviation #6, not in upstream)
-├── adcomputer.rs   # GetComputerObjectNameW + DsGetSiteNameW + GetUserNameExW — 5 AD attrs (deviation #7, not in upstream)
-├── winver.rs       # RtlGetVersion + GetFirmwareType
-├── eventlog.rs     # Install date (registry-derived ISO 8601)
-├── updates.rs      # WUA COM bindings (IUpdateSession3, ISystemInformation, …) + WMI Root\ccm — deviations #26–#31
-└── ad.rs           # ADSI mail lookup stub (phase 2 in upstream)
+├── lib.rs              # Public API + non-Windows stub
+├── runtime.rs          # InternalRuntime::run — async, tokio::spawn_blocking + timeout
+├── sandbox.rs          # Strips io/dofile/require/etc. globals
+├── host.rs             # 58 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── wmi.rs              # COMLibrary + per-namespace cache (root\cimv2, root\ccm, FVE, DeviceGuard)
+├── registry.rs         # RegOpenKeyExW + RegQueryValueExW + RegEnumValueW + REG_* decode (incl. binary)
+├── net.rs              # GetAdaptersAddresses + IPv4 enumeration
+├── hostname.rs         # GetComputerNameExW — 3 variants (deviation #6, not in upstream)
+├── adcomputer.rs       # GetComputerObjectNameW + DsGetSiteNameW + GetUserNameExW — 5 AD attrs (deviation #7, not in upstream)
+├── winver.rs           # RtlGetVersion + GetFirmwareType
+├── setup_history.rs    # OS setup history + install date — deviation #16, renamed from upstream `eventlog.rs` (which never touched the Event Log API), enriched with `MigrationScope` upgrade-chain walk
+├── updates.rs          # WUA COM bindings (IUpdateSession3, ISystemInformation, …) + WMI Root\ccm — deviations #26–#31
+├── evt.rs              # EvtQuery + EvtNext + EvtRender wrapper — deviation #10, not in upstream
+├── bitlocker.rs        # Win32_EncryptableVolume + ExecMethod + recovery-key events — deviation #10/#32-#37, not in upstream
+├── credentialguard.rs  # Win32_DeviceGuard + derived booleans — deviation #10/#38, not in upstream
+└── ad.rs               # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 51 `host.*` bindings exposed to Lua
+### The 58 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
 | `host.env(name)` | `std::env::var` + injected `SDH_HOSTNAME` / `SDH_CLIENT_VERSION` / `SDH_PERIMETER` | `string?` |
-| `host.now_iso8601()` | `eventlog::install_info()["install_date"]` | `string?` |
+| `host.now_iso8601()` | `setup_history::install_info()["install_date"]` | `string?` |
 | `host.wmi_query(class, prop)` | `WMIConnection::raw_query` (cached per class) | `any?` |
 | `host.wmi_all(class)` | `WMIConnection::raw_query` | `array<object>?` |
 | `host.registry_read(hive, key, value)` | `RegOpenKeyExW` + decode (SZ / DWORD / QWORD / MULTI_SZ) | `string \| number \| array?` |
@@ -251,7 +254,7 @@ rust-poc-lua/src/
 | `host.ad_computer_cn()` **(deviation #7)** | `GetComputerObjectNameW(NameCanonical)` | `string?` |
 | `host.ad_computer_site()` **(deviation #7)** | `DsGetSiteNameW` + GP registry fallback | `string?` |
 | `host.mail_address()` **(deviation #7)** | `GetUserNameExW(NameUserPrincipal)` — UPN, offline proxy for `mail` LDAP attr | `string?` |
-| `host.setup_history()` | `eventlog::install_info` | `{install_date, history[]}` |
+| `host.setup_history()` **(deviation #16)** | `setup_history::install_info` — registry walk over `HKLM\SYSTEM\Setup\Source*` subkeys + `MigrationScope` chain resolution | `{install_date, history[]}` |
 | `host.cpu_details()` | WMI `Win32_Processor.Name + SocketDesignation` | `string?` |
 | `host.ram_total()` | WMI `Win32_PhysicalMemory.Capacity` (summed) | `number?` |
 | `host.disk_size(target, property)` | WMI `Win32_LogicalDisk` filtered by `%SystemDrive%` | `number?` |
@@ -260,6 +263,7 @@ rust-poc-lua/src/
 | `host.desktop_resolution()` | WMI `Win32_VideoController.{Current*Resolution, RefreshRate}` | `string?` |
 | `host.chassis_type()` **(deviation #8)** | WMI `Win32_SystemEnclosure.ChassisTypes[0]` → SMBIOS code + label | `{code: number, label: string}?` |
 | `host.virtual_machine()` **(deviation #8)** | CPUID leaf 1 ECX bit 31 (`std::arch::x86_64::__cpuid`) | `bool` |
+| `host.virtualization_capability()` **(deviation #8)** | `(Win32_Processor.VMMonitorModeExtensions && Win32_Processor.VirtualizationFirmwareEnabled) || Win32_ComputerSystem.HypervisorPresent`; mirrors `Virtualization.cs`. Distinct from `virtual_machine()` — answers "can this host virtualize?" not "am I a VM?" | `bool?` |
 | `host.terminal_sessions()` **(deviation #9)** | WTS `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW` + `LookupAccountNameW` | `array<{session_id, station_name, state, user, sid}>?` |
 | `host.os_last_boot_up_time()` | `NtQuerySystemInformation(SystemTimeOfDayInformation).BootTime` → ISO 8601 UTC | `string?` |
 | `host.uso_reboot_required()` **(deviation #10)** | `NtQueryWnfStateData(WNF_USO_REBOOT_REQUIRED)` via [`wnf`](https://docs.rs/wnf) crate — DWORD > 0 → true | `bool?` |
@@ -282,8 +286,15 @@ rust-poc-lua/src/
 | `host.updates_managed_by()` **(deviation #27)** | WUA COM `IUpdateServiceManager2::Services` → `IsDefaultAUService` → `Name`; mirrors `UpdatesManagedBy.cs`; shares `HostState::au_service` cache with #26 | `string?` |
 | `host.updates_reboot_required()` **(deviation #28)** | WUA COM `ISystemInformation::RebootRequired`; mirrors `UpdatesRebootRequired.cs` | `bool?` |
 | `host.updates_reboot_required_before_installation()` **(deviation #29)** | WUA COM `IUpdateInstaller::RebootRequiredBeforeInstallation`; mirrors `UpdatesRebootRequiredBeforeInstallation.cs` | `bool?` |
-| `host.updates_windows_updates()` **(deviation #30)** | WUA COM `IUpdateSession3` → `IUpdateSearcher3` offline search (`"IsInstalled=1 OR IsInstalled=0"`); mirrors `UpdatesWindowsUpdates.cs`; no 90 s timeout thread; shares `HostState::updates_cache` with #31 (one offline search, two consumers) | `array<{title, article_ids, category, update_id, …20 fields}>?` |
-| `host.updates_sccm_updates()` **(deviation #31)** | WMI `Root\ccm\SoftwareUpdates\DeploymentAgent::CCM_TargetedUpdateEx1` joined in-memory against the shared `HostState::updates_cache` index (no second offline search); mirrors `UpdatesSccmUpdates.cs`; returns `[]` when no SCCM agent (`WBEM_E_INVALID_NAMESPACE`) | `array<{update_id, title, article_ids, installed, …11 fields}>` |
+| `host.updates_windows_updates()` **(deviation #30)** | WUA COM `IUpdateSession3` → `IUpdateSearcher3` offline search (`"IsInstalled=1 OR IsInstalled=0"`); mirrors `UpdatesWindowsUpdates.cs`; no 90 s timeout thread; sole consumer of `HostState::updates_cache` since the #31 refactor | `array<{title, article_ids, category, update_id, …20 fields}>?` |
+| `host.updates_sccm_updates()` **(deviation #31)** | 4-source merge faithful to `Updates.cs::GetSccmUpdates`: WMI `Root\ccm\SoftwareUpdates\UpdatesStore::CCM_UpdateStatus` (pivot) + `…\DeploymentAgent::CCM_TargetedUpdateEx1` (substring lookup on `UpdateId`) + `Root\ccm\StateMsg::CCM_StateMsg` (filtered `TopicType=="500"`, substring lookup on `TopicID`) + WUA online `IUpdateSearcher::QueryHistory(0, total)` (install date + `ResultCode==orcSucceeded`); DTO is strict 1:1 with `SccmUpdate.cs` (9 fields). Returns `[]` when SCCM absent (`WBEM_E_INVALID_NAMESPACE` on `UpdatesStore`); WUA history failure (3 retries) degrades to empty history with `install_date=null` | `array<{article_id, category, install_date, installed, required, superseded, targeted, title, update_id}>` |
+| `host.bitlocker_volume_status(mount_point)` **(deviation #33)** | WMI `Win32_EncryptableVolume WHERE DriveLetter='<mp>'` in `root\CIMV2\Security\MicrosoftVolumeEncryption` + `ExecMethod("GetConversionStatus", PrecisionFactor=1)`; mirrors `BitlockerStatus.cs` + `BitLockerEncryptionPercentage.cs` | `{drive_letter, encryption_method, protection_status, conversion_status, encryption_percentage, encryption_flags, wiping_status, wiping_percentage}?` |
+| `host.bitlocker_key_protector_ids(mount_point, type)` **(deviation #34)** | WMI `ExecMethod("GetKeyProtectors", KeyProtectorType=<type>)`; types per `KeyProtectorType` enum (3=NumericPassword, 7=PublicKey/DRA); IDs lowercased to match escrow casing | `array<string>?` |
+| `host.bitlocker_dra_thumbprints(mount_point)` **(deviation #35)** | `GetKeyProtectors(7)` + per-ID `ExecMethod("GetKeyProtectorCertificate")` → `CertThumbprint`; mirrors `BitLockerDRACertThumbPrints.cs` | `array<string>?` |
+| `host.bitlocker_policy()` **(deviation #36)** | Registry `HKLM\SOFTWARE\Policies\Microsoft\FVE` value-name enumeration against 8 enforcement names (`EncryptionMethodWithXtsOs`, `UseTPM`, …); mirrors `BitLockerPolicy.cs` / `DataService.GetFVEStatus` | `"Enabled" \| "MissingRegistryKey" \| nil` |
+| `host.bitlocker_escrowed_protector_ids(event_id)` **(deviation #37a)** | `EvtQuery + EvtRender` on `Microsoft-Windows-BitLocker/BitLocker Management` for `event_id` (783=AD, 845=AzureAD); lowercased `ProtectorGUID` values; mirrors `BitLockerService.EscrowedRecoveryKeyProtectorIdsFromEvents` | `array<string>?` |
+| `host.bitlocker_recovery_key_rotation_executed()` **(deviation #37b)** | Registry `ShutdownTime` (FILETIME) + events 864 (rotation) and 775 (key event, `ProtectorType=0x3`); three-state: `true`=rotation completed, `false`=in progress, `nil`=never rotated. Mirrors `BitLockerService.RecoveryKeyRotationFromEventsExecuted` | `bool?` |
+| `host.credential_guard_status()` **(deviation #38)** | WMI `Win32_DeviceGuard` in `root\Microsoft\Windows\DeviceGuard`; full 13-field row + two derived booleans (`is_credential_guard_configured`, `is_credential_guard_running`) computed in Rust mirroring `CredentialGuardStatus.Create` from `ComplianceApp.Shared` | `{...13 fields + 2 derived booleans}?` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -301,9 +312,14 @@ cargo run
 # host.env("SDH_PERIMETER"))
 cargo run -- general.lua some-perimeter
 
-# Pipe-friendly: only the JSON goes to stdout, logs/progress to stderr
-cargo run --quiet > config.json
-cargo run --quiet | jq '.machine_name'
+# Pipe-friendly: JSON goes to stdout WHEN stdout is not a TTY
+# (i.e. piped or redirected). Interactive terminals get a silent
+# stdout; the per-run audit file under <log_dir> is the canonical
+# artefact in that case — its path is announced on stderr via the
+# tracing `info!` line "wrote JSON output file".
+cargo run --quiet > config.json                # stdout is a file → JSON written
+cargo run --quiet | jq '.machine_name'         # stdout is a pipe → JSON written
+cargo run -- general.lua                       # stdout is a TTY  → silent stdout
 ```
 
 The binary lives at `src/main.rs` and is produced as
@@ -311,8 +327,9 @@ The binary lives at `src/main.rs` and is produced as
 validates the script path via `resolve_script_path` (canonicalise +
 `starts_with` to refuse traversal), constructs an `InternalRuntime`,
 calls `runtime.run(...)` with a 30s wall-clock timeout, and pretty-
-prints the returned JSON. Logs and progress go to stderr; only the
-JSON goes to stdout.
+prints the returned JSON. Logs and progress go to stderr; the JSON
+goes to stdout only when stdout is not a terminal (TTY detection via
+[`std::io::IsTerminal`], stable since Rust 1.70).
 
 Exit codes: `0` success, `1` Lua runtime error (script error or
 timeout), `2` cannot read hostname, `3` cannot serialize output, `4`
@@ -321,7 +338,7 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **fourteen** points where copying upstream byte-for-byte
+There are exactly **sixteen** points where copying upstream byte-for-byte
 would not compile or would not match the surface this PoC needs to
 expose. Each one is documented inline at the touch site so a future
 re-sync is mechanical.
@@ -413,22 +430,46 @@ re-sync is mechanical.
    Until then, `Copy-Item` MUST preserve `adcomputer.rs` and the
    `install_ad_computer_bindings` call in `host.rs`.
 
-8. **`rust-poc-lua/src/host.rs` — two hardware enrichment bindings.**
+8. **`rust-poc-lua/src/host.rs` — three hardware enrichment bindings.**
    Not in upstream. Added as composite bindings inside
    `install_composites()`:
    - `host.chassis_type()` — reads `Win32_SystemEnclosure.ChassisTypes[0]`
      (SMBIOS Type-3 code) and translates it to a human-readable label
      via the `chassis_type_str()` match table (codes 1–36, SMBIOS 3.x
      spec §7.4). Returns `nil` on WMI failure.
-   - `host.virtual_machine()` — issues a single CPUID instruction
-     (`std::arch::x86_64::__cpuid(1)`) and tests ECX bit 31 (the
-     hypervisor-present bit, mandatory by the x86 hypervisor discovery
-     protocol). Returns `true` on Hyper-V, VMware, VirtualBox, KVM;
-     `false` on bare metal or any non-x86_64 target. Requires no COM
-     initialisation and works when WMI is unavailable.
+   - `host.virtual_machine()` — answers "am I running INSIDE a VM?".
+     Primary signal: WMI `Win32_ComputerSystem.Model` against a small
+     allow-list (`"Virtual Machine"`, `"VMware"`, `"VirtualBox"`,
+     `"QEMU"`). Fallback: CPUID leaf 1 ECX bit 31 (hypervisor-present)
+     plus the vendor leaf at `0x40000000` to filter out `"Microsoft Hv"`
+     (which Windows reports on bare metal whenever VBS is active).
+     Returns `false` on any non-x86_64 target. Requires no COM
+     initialisation when the fallback fires.
+   - `host.virtualization_capability()` — answers a different question:
+     "CAN this host virtualize (or is it already doing so)?".  Faithful
+     port of `ComplianceApp/DataTransformers/BIOS/Virtualization.cs`:
+     `(Win32_Processor.VMMonitorModeExtensions
+       && Win32_Processor.VirtualizationFirmwareEnabled)
+      || Win32_ComputerSystem.HypervisorPresent`.
+     Missing WMI properties degrade to `false` per the C# nullable-state
+     semantics (`null_enum == specific_state` is always false).  Returns
+     `nil` only on a hard WMI failure (COM init / namespace unreachable),
+     in which case the failure is also surfaced via `host.errors()`.
+     The pure formula (`compute_virtualization_capability`) is extracted
+     to enable truth-table unit testing without a live WMI stack.
+   **Why both `virtual_machine` and `virtualization_capability`?** They
+   answer two orthogonal questions that the `Win10-Laptop.json` schema
+   exposes as separate fields:
+   - A physical laptop hosting Credential Guard answers `false` to
+     `virtual_machine()` and `true` to `virtualization_capability()`.
+   - A Hyper-V guest answers `true` to both.
+   - An old BIOS-disabled bare-metal machine answers `false` to both.
    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve
-   `bind_chassis_type`, `bind_virtual_machine`, `chassis_type_str`, and
-   their calls inside `install_composites`.
+   `bind_chassis_type`, `bind_virtual_machine`,
+   `bind_virtualization_capability`, the pure
+   `compute_virtualization_capability` helper, `chassis_type_str`, the
+   `#[cfg(test)] mod tests` block in `host.rs`, and the matching calls
+   inside `install_composites`.
 
 9. **`rust-poc-lua/src/updates.rs` + `install_updates_bindings` in
    `host.rs` — six System Updates bindings.**
@@ -444,23 +485,59 @@ re-sync is mechanical.
      `IUpdateInstaller::RebootRequiredBeforeInstallation`.
    - `host.updates_windows_updates()` — déviation #30. Faithful offline WUA
      search; no 90 s `CancellationToken` timeout thread (synchronous; `spawn_blocking`
-     provides isolation).
-   - `host.updates_sccm_updates()` — déviation #31. WMI `Root\ccm` + WUA
-     offline bulk search for in-memory join (no N individual searches). Returns
-     `[]` when SCCM agent is absent (`WBEM_E_INVALID_NAMESPACE`); propagates any
-     other WMI/CCM failure into `host.errors()`.
+     provides isolation).  Sole consumer of `HostState::updates_cache`
+     since the #31 refactor.
+   - `host.updates_sccm_updates()` — déviation #31. **4-source merge
+     faithful to `Updates.cs::GetSccmUpdates`**, replacing the older
+     "WUA offline cache join" approach which suffered from massive
+     `UpdateID` cache misses (only ~10% of CCM rows had a matching WUA
+     entry).  Sources:
+     - `Root\ccm\SoftwareUpdates\UpdatesStore::CCM_UpdateStatus` —
+       primary pivot (`UniqueId`, `Article`, `Title`,
+       `UpdateClassification`).
+     - `Root\ccm\SoftwareUpdates\DeploymentAgent::CCM_TargetedUpdateEx1` —
+       provides `Superseded`, joined via case-insensitive substring
+       match of `UpdateId.Contains(uniqueId)`.
+     - `Root\ccm\StateMsg::CCM_StateMsg` — filtered `TopicType=="500"`
+       (Software Updates topics); provides `StateID` (3=installed,
+       2=required), joined via substring match of
+       `TopicID.Contains(uniqueId)`.
+     - WUA online `IUpdateSearcher::QueryHistory(0, total)` — provides
+       install `Date` (OLE DATE → ISO 8601 UTC) and
+       `ResultCode==orcSucceeded`; 3-retry loop with 100/200/300 ms
+       backoff (mirrors C# `MAX_RETRY_ATTEMPTS`). On final failure the
+       merge continues with empty history (`install_date=null`).
+     - **DTO is strict 1:1 with `SccmUpdate.cs`**: 9 snake-case fields
+       (`article_id`, `category`, `install_date`, `installed`,
+       `required`, `superseded`, `targeted`, `title`, `update_id`).
+       The previous 11-field shape with `cve_ids` / `msrc_severity` /
+       `reboot_required` was retired; those signals remain available
+       per OS-level update through `host.updates_windows_updates()`.
+     - Final filter: `WHERE Targeted == true`. Final sort:
+       `install_date` nulls last, then DESC, then `article_id` ASC,
+       then `title` ordinal, then `update_id` ordinal.
+     - `UpdateClassification` GUID → human label uses a 13-entry
+       mapping verbatim from `Updates.cs:453-468`
+       ([WUA classification GUIDs reference](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ff357803(v=vs.85))).
+     - The duplicate-`UniqueId` merge rules (`||` for booleans,
+       max for `install_date`, `0→non-zero` for `article_id`, first-fill
+       for nullable strings) mirror `Updates.cs:646-660` exactly.
+     - Returns `[]` when SCCM absent (`WBEM_E_INVALID_NAMESPACE` on
+       `Root\ccm\SoftwareUpdates\UpdatesStore`). Each secondary
+       namespace tolerates its own `INVALID_NAMESPACE` independently
+       and degrades to "no superseded info" / "no state info" rather
+       than aborting.
 
    **Per-run caches on `HostState`** — two lazy-init fields mirror the
    existing `wmi: Option<Wmi>` pattern, both shaped as tri-state enums
    so init failures are memoised (no expensive retry) and surfaced
    under a single canonical error key:
    - `updates_cache: UpdatesCacheState` (`NotInit | Ready(UpdatesCache)
-     | Failed`) — one offline WUA search builds both the full update
-     list (#30) and the `UpdateID → WuaMeta` join index (#31).  Halves
-     the most expensive call when both bindings are consumed in the
-     same run.  Init failures are recorded once under the canonical key
-     `ERR_KEY_WUA_CACHE_INIT = "updates:wua_cache_init"`; SCCM rows
-     still come through with `null` enrichment.
+     | Failed`) — one offline WUA search builds the full update list
+     consumed by #30. Before the #31 refactor this cache also held an
+     `UpdateID → WuaMeta` index for the SCCM join; that index has been
+     removed, the SCCM path is now source-independent. Init failures
+     recorded once under `ERR_KEY_WUA_CACHE_INIT = "updates:wua_cache_init"`.
    - `au_service: AuServiceState` (`NotInit | Ready(Option<(bool,
      String)>) | Failed`) — one `IUpdateServiceManager2::Services`
      enumeration feeds both #26 and #27.  The inner `Option` of `Ready`
@@ -473,6 +550,149 @@ re-sync is mechanical.
    the `install_updates_bindings` call, both `HostState` cache fields,
    their tri-state enums, and their accessor methods
    (`ensure_updates_cache()`, `ensure_au_service()`).
+
+10. **`rust-poc-lua/src/bitlocker.rs` + `credentialguard.rs` + `evt.rs`
+    + `install_hardening_bindings` in `host.rs` — seven hardening
+    bindings.**
+    Not in upstream. Implements the BitLocker + Credential Guard
+    sub-trees of `Win10-Laptop.json` by mirroring `BitLockerService.cs`,
+    `BitlockerStatus.cs`, `BitLockerEncryptionPercentage.cs`,
+    `BitLockerPolicy.cs`, `BitLockerDRACertThumbPrints.cs`, the seven
+    `DataTransformers/BitLocker/*.cs` files, and the `Bios.cs`
+    Credential Guard helper. Requires features `Win32_System_EventLog`
+    and `Win32_System_Registry` in `rust-poc-lua/Cargo.toml`.
+
+    - `host.bitlocker_volume_status(mount_point)` — déviation #32. WMI
+      `Win32_EncryptableVolume` in `root\CIMV2\Security\MicrosoftVolumeEncryption`
+      + `ExecMethod("GetConversionStatus", PrecisionFactor=1)`. Returns
+      `nil` on absent volume (e.g. running off a non-BitLocker drive).
+      Encryption percentage and conversion status come from the same
+      `ExecMethod` call — `Win32_EncryptableVolume` does **not** expose
+      them as plain properties (the C# transformer does the same
+      ExecMethod dance, see `BitLockerEncryptionPercentage.cs`).
+    - `host.bitlocker_key_protector_ids(mount_point, type)` — déviation #33.
+      WMI `ExecMethod("GetKeyProtectors", KeyProtectorType=<n>)`. IDs are
+      lowercased to canonicalise against event-log payloads (which
+      historically use lowercase GUIDs).
+    - `host.bitlocker_dra_thumbprints(mount_point)` — déviation #34.
+      Composes #33 with type=7 + per-ID
+      `ExecMethod("GetKeyProtectorCertificate")` → `CertThumbprint`.
+    - `host.bitlocker_policy()` — déviation #35. Registry value-name
+      enumeration over `HKLM\SOFTWARE\Policies\Microsoft\FVE` against
+      an 8-entry whitelist; returns `"Enabled"` if any present,
+      `"MissingRegistryKey"` otherwise.
+    - `host.bitlocker_escrowed_protector_ids(event_id)` — déviation #36.
+      `EvtQuery + EvtRender` on `Microsoft-Windows-BitLocker/BitLocker Management`
+      for a given event ID (783=AD backup, 845=Azure AD backup).
+    - `host.bitlocker_recovery_key_rotation_executed()` — déviation #37.
+      Three-state: registry `ShutdownTime` (FILETIME) → boot time →
+      event 864 (rotation since boot) + event 775 (`ProtectorType=0x3`
+      near rotation time). Returns `true`=rotation completed since
+      boot, `false`=rotation in progress (864 fired but no matching
+      775), `nil`=never rotated.
+    - `host.credential_guard_status()` — déviation #38. WMI
+      `Win32_DeviceGuard` in `root\Microsoft\Windows\DeviceGuard` →
+      13 fields verbatim + two derived booleans
+      (`is_credential_guard_configured`, `is_credential_guard_running`)
+      computed in Rust to mirror `CredentialGuardStatus.Create` in
+      `ComplianceApp.Shared`.
+
+    **Cross-cutting extensions to existing modules:**
+    - `wmi.rs` — single-namespace cache replaced by per-namespace cache
+      (`HashMap<namespace, (WMIConnection, HashMap<class, Vec<Row>>)>`).
+      Backwards-compatible — `query_first` / `query_all` keep
+      `root\cimv2` default. New methods `query_first_ns`,
+      `query_all_ns`, `query_filtered_first_ns`, plus a connection
+      accessor that lets callers invoke `exec_instance_method`
+      directly (the `wmi` crate 0.17 exposes ExecMethod without raw
+      COM).
+    - `registry.rs` — new `enum_value_names(hive, key)` via
+      `RegEnumValueW` + new `read_binary(hive, key, value)` for the
+      `ShutdownTime` FILETIME read.
+    - `evt.rs` — new module wrapping `EvtQuery + EvtNext + EvtRender`.
+      Uses the **XML rendering path** (`EvtRenderEventXml`) plus an
+      ad-hoc string scanner for `<TimeCreated SystemTime='…'>` and
+      `<Data Name='X'>Y</Data>`. The alternative
+      `EvtCreateRenderContext + EvtRenderEventValues` is faster but
+      requires pre-declaring every value path; for the < 100 events a
+      machine emits on the BitLocker channel, the XML path is plenty
+      fast and stays generic over future schema drift. XPath template:
+      `*[System[Provider[@Name='X'] and (EventID=N) and TimeCreated[@SystemTime>='ISO']]]`
+      — the `Provider[@Name]` predicate is the same shape PowerShell
+      builds for `Get-WinEvent -FilterHashtable @{ProviderName='X'; Id=N}`
+      (functionally a no-op on dedicated channels like BitLocker
+      Management, but useful template for shared channels).
+
+      **PITFALL — `EvtRender` emits single-quoted attribute values**
+      (`Name='X'`), not double-quoted, on Windows 10+. PowerShell's
+      `EventLogRecord.ToXml()` returns the same XML bytes. Any custom
+      XML scanner MUST accept both `'` and `"` delimiters (XML 1.0
+      §3.1). The original scanner only handled `"` and silently
+      dropped every BitLocker `<Data>` payload on the floor —
+      `bitlocker_escrowed_protector_ids` returned empty arrays even
+      when events existed. See the regression tests
+      `evt::tests::*_single_quoted_real_bitlocker` which pin the
+      exact byte-for-byte XML returned on a domain-joined endpoint.
+      A second latent bug surfaced during the same fix —
+      `<Data Name='X'/>` self-closing form stealing the next entry's
+      content — also pinned via
+      `evt::tests::self_closing_data_does_not_steal_next_value`.
+
+    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve
+    `install_hardening_bindings` and its call from `install_all()`,
+    plus `bitlocker.rs`, `credentialguard.rs`, `evt.rs`, the
+    per-namespace cache in `wmi.rs`, `enum_value_names` /
+    `read_binary` in `registry.rs`, and the `Win32_System_EventLog`
+    feature in `Cargo.toml`.
+
+11. **`rust-poc-lua/src/setup_history.rs` (renamed from `eventlog.rs`)
+    + `registry::subkey_names` / `try_subkey_names` extension.**
+    Three related changes that together form deviation #16:
+
+    - **(a) Module rename.** Upstream ships
+      `sdh-fleet-client/lua/src/eventlog.rs`, a name chosen in
+      anticipation of a phase-2 implementation that would parse the
+      Setup event log via `EvtQuery` + `EvtRender`. That phase never
+      landed upstream — `eventlog.rs` only ever read the registry —
+      and in this PoC the real Event Log wrapper now lives in
+      `evt.rs` (deviation #10). Coexisting `eventlog.rs` and `evt.rs`
+      made the module names actively misleading, so `eventlog.rs` is
+      renamed to `setup_history.rs` to match what the module actually
+      does (mirror of `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`
+      + `HKLM\SYSTEM\Setup\Source*` subkeys).
+    - **(b) Enriched body.** The upstream `install_info()` is a one-
+      shot read of the `InstallDate` DWORD plus a stubbed empty
+      `history` array. The rust-poc-lua version walks the
+      `Source OS (Updated on …)` subkeys, sorts by `InstallDate`
+      ascending, and derives the canonical install date through a
+      `MigrationScope` chain-resolution algorithm (see the
+      module-level doc + the `derive_install_date` doc + the
+      `#[cfg(test)] mod tests` block with five truth-table cases).
+      Empirical convention: `MigrationScope == "5"` marks an entry
+      that has been overwritten by a later in-place upgrade; `""`
+      (or absent) marks the live or chain-terminating entry. Pinned
+      against a 23H2 → 24H2 upgrade observed on the workspace
+      owner's machine.
+    - **(c) `registry.rs` extension.** The walk requires
+      `RegEnumKeyExW`, which upstream's `registry.rs` does not expose
+      (it only has `RegQueryValueExW` + `RegEnumValueW`). Two new
+      functions are added: `subkey_names(hive, key) -> Vec<String>`
+      (returns `[]` on any error — convenient for the registry-walk
+      callsite) and `try_subkey_names(hive, key) -> Result<Vec<String>,
+      String>` (distinguishes "key absent" from "permission denied"
+      for the unit tests). Same shape as the `try_*` / non-`try_*`
+      pair pattern used elsewhere in `registry.rs`.
+
+    Re-sync impact: `Copy-Item` of `eventlog.rs` from upstream would
+    **silently regress** the `MigrationScope` chain-resolution logic
+    (and break compilation — the file no longer exists under that
+    name). Before any future re-sync, decide whether to (i)
+    upstream the rename + enrichment, or (ii) preserve
+    `setup_history.rs` locally and skip the `eventlog.rs` Copy-Item
+    step. `Copy-Item` of `registry.rs` from upstream MUST preserve
+    `subkey_names` / `try_subkey_names` and the imports
+    (`RegEnumKeyExW`) they pull in, alongside the already-documented
+    `enum_value_names` / `read_binary` (deviation #10).
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is
@@ -550,8 +770,13 @@ studying when the crate's source rolls past:
 - `ad::current_user_mail_blocking` — always returns `None` even on
   domain-joined machines. Phase 2 in upstream too. Real impl needs
   `IADs::Get("mail")` via `windows::Win32::System::Ole`.
-- `eventlog::install_info().history` — always `[]`. Real impl needs
-  `EvtQuery` + `EvtRender` to parse the Setup event log.
+- `setup_history::install_info().history` — populated by walking the
+  `HKLM\SYSTEM\Setup\Source*` registry subkeys. The upstream
+  `eventlog::install_info()` returns `[]` here; the rust-poc-lua port
+  enriches it (see deviation #16). A future `EvtQuery` + `EvtRender`
+  pass against the Setup event log could add per-upgrade events that
+  the registry-derived history misses (e.g. failed upgrades that left
+  no `Source OS *` subkey).
 
 Both stubs are documented in their source files. They surface as `null`
 or `[]` in the JSON output, never as errors.

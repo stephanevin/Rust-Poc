@@ -18,13 +18,29 @@
 //! ```
 //!
 //! Logs and progress go to stderr (plus a JSON daily-rolling file under
-//! the resolved log directory — see the `logging` module). Only the
-//! JSON result goes to stdout, so the binary is pipe-friendly:
+//! the resolved log directory — see the `logging` module).
+//!
+//! ## Stdout behaviour (TTY-aware)
+//!
+//! The JSON result is sent to stdout **only when stdout is not a TTY**
+//! (i.e. piped or redirected).  When the binary runs in an interactive
+//! console, the JSON dump is suppressed to keep the scrollback clean —
+//! the per-run audit file under `log_dir` remains the canonical
+//! artefact in that case (its path is announced by a tracing `info!`
+//! line on stderr).
+//!
+//! This is the same idiom modern CLIs use (`git log` paginates on TTY,
+//! `git log | cat` emits raw bytes); it preserves the pipe-friendly
+//! contract:
 //!
 //! ```text
-//! cargo run --quiet > all.json
-//! cargo run --quiet -- general.lua | jq '.machine_name'
+//! cargo run --quiet > all.json                       # stdout is a file → JSON written
+//! cargo run --quiet -- general.lua | jq '.machine_name'  # stdout is a pipe → JSON written
+//! cargo run -- general.lua                           # stdout is a TTY  → silent stdout
 //! ```
+//!
+//! Use [`std::io::IsTerminal`] (stable since 1.70) to flip the behaviour
+//! in tests by replacing `std::io::stdout()` with a non-terminal mock.
 //!
 //! ## Combined output format (no-arg mode)
 //!
@@ -66,6 +82,7 @@
 
 mod logging;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -159,7 +176,7 @@ async fn main() -> ExitCode {
             Ok(value) => match serde_json::to_string_pretty(&value) {
                 Ok(json) => {
                     write_output_file(&log_dir, &script, &hostname, &json);
-                    println!("{json}");
+                    emit_stdout_when_piped(&json);
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -178,7 +195,7 @@ async fn main() -> ExitCode {
         match serde_json::to_string_pretty(&value) {
             Ok(json) => {
                 write_output_file(&log_dir, "all", &hostname, &json);
-                println!("{json}");
+                emit_stdout_when_piped(&json);
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -187,6 +204,31 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Writes the JSON payload to stdout **only** when stdout is not a TTY
+/// — i.e. when the user is piping or redirecting (`| jq`, `> file.json`).
+///
+/// In an interactive terminal we stay silent: dumping several MB of JSON
+/// into the scrollback is noisy and the per-run audit file under
+/// `log_dir` is the canonical artefact anyway (its path is announced by
+/// the tracing `info!` line `wrote JSON output file`).
+///
+/// This is the same idiom modern CLIs use (`git log` paginates on TTY
+/// and pipes raw bytes on non-TTY) ; it preserves the pipe-friendly
+/// contract documented at the top of this file.
+///
+/// Rust concept: [`std::io::IsTerminal`] is the stable cross-platform
+/// trait (1.70+) for "is this fd attached to a real console ?".  On
+/// Windows it calls `GetConsoleMode`, on Unix it calls `isatty(3)`.
+/// Older crates like `is-terminal` are now redundant.
+fn emit_stdout_when_piped(json: &str) {
+    if std::io::stdout().is_terminal() {
+        // Interactive console: suppress the dump.  The audit file path
+        // is already on stderr via the tracing layer.
+        return;
+    }
+    println!("{json}");
 }
 
 /// Runs every `*.lua` file found in `cache_dir` (alphabetically) and merges
