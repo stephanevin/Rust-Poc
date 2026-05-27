@@ -231,10 +231,11 @@ rust-poc-lua/src/
 ├── bitlocker.rs        # Win32_EncryptableVolume + ExecMethod + recovery-key events — deviation #10/#32-#37, not in upstream
 ├── credentialguard.rs  # Win32_DeviceGuard + derived booleans — deviation #10/#38, not in upstream
 ├── cloud.rs            # NetGetAadJoinInformation + WMI root\CIMV2\mdm + cert store + event 208/209 — deviation #39, not in upstream
+├── ep.rs               # ROOT\SecurityCenter2\AntiVirusProduct + ProductState decode + ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus — deviation #40, not in upstream
 └── ad.rs               # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 64 `host.*` bindings exposed to Lua
+### The 66 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -302,6 +303,8 @@ rust-poc-lua/src/
 | `host.mdm_device_id()` **(deviation #39)** | Same WMI thumbprint → `CertGetNameStringW(CERT_NAME_SIMPLE_DISPLAY_TYPE)` → strip `"CN="`; mirrors `MdmDeviceId.cs` | `string?` |
 | `host.mdm_co_management_flags()` **(deviation #39)** | Registry `HKLM\SOFTWARE\Microsoft\DeviceManageabilityCSP\Provider\WMI_Bridge_Server\ConfigInfo` (DWORD → decimal string); `None` when key absent; mirrors `MdmCoManagementFlags.cs` | `string?` |
 | `host.mdm_sync_status()` **(deviation #39)** | EventID 208 (start; `Message1`=enrollment ID) × EventID 209 (end; `HRESULT`) paired by `(ProcessID, ThreadID)` from `<Execution …/>`, filtered on `CurrentEnrollmentId` registry value; mirrors `LastMdmSync{Date,Result,SuccessDate}.cs` | `{last_sync_date?, last_success_sync_date?, last_sync_result?}?` |
+| `host.security_center_av_products()` **(deviation #40)** | WMI `ROOT\SecurityCenter2\AntiVirusProduct` `SELECT *`; decodes `ProductState` bitmask (status / signatures / owner) from `AntiVirusEnums.cs`; returns all products — Lua script filters by `name` (e.g. `"Sentinel Agent"` for SentinelOne); mirrors `SentinelOne.cs` + `AntiVirusEnums.cs` from ComplianceApp | `array<{name, state, signatures, owner, path?, product_state_raw}>` |
+| `host.windows_defender_status()` **(deviation #40)** | WMI `ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus` `SELECT *`; returns the single-row status object in WMI PascalCase (`AMServiceEnabled`, `AMRunningMode`, `AntivirusEnabled`, `RealTimeProtectionEnabled`, `ProductStatus`, …); `nil` when Defender absent / namespace unreachable; mirrors `WindowsDefender.cs::GetWindowsDefenderStatusFromCim()` | `{AMServiceEnabled, AMRunningMode, AntivirusEnabled, RealTimeProtectionEnabled, ProductStatus, …}?` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -345,7 +348,7 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **sixteen** points where copying upstream byte-for-byte
+There are exactly **seventeen** points where copying upstream byte-for-byte
 would not compile or would not match the surface this PoC needs to
 expose. Each one is documented inline at the touch site so a future
 re-sync is mechanical.
@@ -760,6 +763,54 @@ re-sync is mechanical.
     `cloud.rs`, the `install_cloud_bindings` call in `install()`, and
     the `system_attrs` field in `evt.rs::EventRecord` together with
     `extract_system_attrs` + `scan_attrs_into`.
+
+13. **`rust-poc-lua/src/ep.rs` + `install_ep_bindings` in
+    `host.rs` + `mod ep` in `lib.rs` — two Endpoint Protection bindings.**
+    Not in upstream. Implements the EP sub-tree of `Win10-Laptop.json`
+    (SentinelOne + Windows Defender) without SEP (excluded). Deviation #40.
+
+    - `host.security_center_av_products()` — `SELECT * FROM AntiVirusProduct`
+      in `ROOT\SecurityCenter2`.  Each row's `ProductState` u32 bitmask is
+      decoded into three human-readable sub-fields following
+      `AntiVirusEnums.cs` from ComplianceApp:
+      - `state` (`"On"` / `"Off"` / `"Snoozed"` / `"Expired"`) from bits
+        12-15 (mask `0x0000_F000`).
+      - `signatures` (`"UpToDate"` / `"OutOfDate"`) from bits 4-7 (mask
+        `0x0000_00F0`; zero = up-to-date).
+      - `owner` (`"Microsoft"` / `"ThirdParty"`) from bits 8-11 (mask
+        `0x0000_0F00`; `0x0100` = Microsoft).
+      Returns all products; the Lua script filters by `name` for the
+      specific product it needs (e.g. `"Sentinel Agent"` for SentinelOne).
+      An empty array is a valid result.
+
+    - `host.windows_defender_status()` — `SELECT * FROM MSFT_MpComputerStatus`
+      in `ROOT\Microsoft\Windows\Defender`.  Returns the single-row object
+      with WMI PascalCase property names as-is (no field renaming), for
+      direct mapping to the six `WindowsDefender*` fields in
+      `Win10-Laptop.json` (`AMServiceEnabled`, `AMRunningMode`,
+      `AMProductVersion`, `AntivirusEnabled`, `RealTimeProtectionEnabled`,
+      `ProductStatus`).  Returns `nil` when the namespace is absent (Server
+      SKUs with Defender uninstalled) or the class returns no rows (Defender
+      fully disabled by GPO or replaced by a third-party AV).
+
+    **Win32 vs WMI rationale.** WSCAPI (`IWSCProductList` / `IWscProduct`
+    in `wscapi.dll`) is the public Win32 alternative to querying
+    `root\SecurityCenter2`.  However, those COM interfaces are absent from
+    `windows-rs` 0.62 — `Win32::System::Antimalware` only covers AMSI
+    (`IAmsiStream`, `AmsiScanBuffer`…), not the product-status query
+    surface.  For Windows Defender, no public Win32 API exists for
+    `MSFT_MpComputerStatus`; the `MpClient.dll` COM interface is
+    undocumented.  WMI is therefore the only correct choice for both
+    bindings, matching the ComplianceApp implementation.
+
+    **No new Cargo features.** `Win32_System_Com` (already present for WMI
+    init) covers all COM initialisation needed for both namespaces.
+    `ensure_ns` in `wmi.rs` handles per-namespace connection caching
+    transparently — no new `HostState` cache fields.
+
+    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve `ep.rs`, the
+    `install_ep_bindings` call in `install()`, and the `ep` module
+    declaration in `lib.rs`.
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is

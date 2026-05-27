@@ -16,8 +16,8 @@ use mlua::{
 };
 
 use super::{
-    accounts, ad, bitlocker, cloud, credentialguard, gpo, net, regional, registry, software, tls,
-    updates, winver, wmi::Wmi, wnf, wts,
+    accounts, ad, bitlocker, cloud, credentialguard, ep, gpo, net, regional, registry, software,
+    tls, updates, winver, wmi::Wmi, wnf, wts,
 };
 
 /// Canonical `host.errors()` key for any failure of
@@ -284,6 +284,7 @@ pub(super) fn install(
     install_updates_bindings(lua, &host, &state)?;
     install_cloud_bindings(lua, &host, &state)?;
     install_hardening_bindings(lua, &host, &state)?;
+    install_ep_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -889,6 +890,67 @@ fn lua_to_value_or_nil(
     }
 }
 
+/// Installs a zero-arg `host.*` binding backed by a WMI query that returns
+/// a JSON array wrapped in `serde_json::Value::Array`.
+fn bind_wmi_json_array(
+    lua: &Lua,
+    host: &Table,
+    state: &HostRef,
+    name: &'static str,
+    error_key: &'static str,
+    f: fn(&mut super::wmi::Wmi) -> Result<Vec<serde_json::Value>, String>,
+) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        name,
+        lua.create_function(move |lua, ()| {
+            let mut st = s.borrow_mut();
+            let res = match st.wmi() {
+                Ok(wmi) => f(wmi).map(serde_json::Value::Array),
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(v) => Ok(lua_to_value_or_nil(lua, &mut st, error_key, &v)),
+                Err(e) => {
+                    st.record_error(error_key, e);
+                    Ok(Value::Nil)
+                }
+            }
+        })?,
+    )
+}
+
+/// Installs a zero-arg `host.*` binding backed by a WMI query that returns
+/// an optional JSON object (`Ok(None)` → Lua `nil`).
+fn bind_wmi_json_option(
+    lua: &Lua,
+    host: &Table,
+    state: &HostRef,
+    name: &'static str,
+    error_key: &'static str,
+    f: fn(&mut super::wmi::Wmi) -> Result<Option<serde_json::Value>, String>,
+) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        name,
+        lua.create_function(move |lua, ()| {
+            let mut st = s.borrow_mut();
+            let res = match st.wmi() {
+                Ok(wmi) => f(wmi),
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(Some(v)) => Ok(lua_to_value_or_nil(lua, &mut st, error_key, &v)),
+                Ok(None) => Ok(Value::Nil),
+                Err(e) => {
+                    st.record_error(error_key, e);
+                    Ok(Value::Nil)
+                }
+            }
+        })?,
+    )
+}
+
 fn install_software_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
     // host.os_software_installed() — HKLM Uninstall registry + WTS per-user.
     // Mirrors OSSoftwareInstalled.cs + OperatingSystem.GetSoftwareInstalled().
@@ -1488,6 +1550,39 @@ fn install_hardening_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRe
             })?,
         )?;
     }
+
+    Ok(())
+}
+
+// --- Endpoint Protection (EP) — deviation #40 -------------------------
+
+fn install_ep_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.security_center_av_products() — WMI ROOT\SecurityCenter2\AntiVirusProduct.
+    // Returns every AV product registered with Windows Security Center, with decoded
+    // ProductState bitmask.  Lua filters by name for the specific product it needs.
+    // Mirrors SentinelOne.cs + AntiVirusEnums.cs from ComplianceApp.
+    bind_wmi_json_array(
+        lua,
+        host,
+        state,
+        "security_center_av_products",
+        "ep:security_center_av_products",
+        ep::security_center_av_products,
+    )?;
+
+    // host.windows_defender_status() — WMI ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus.
+    // Returns Defender runtime fields in WMI PascalCase (AMServiceEnabled,
+    // AMRunningMode, AntivirusEnabled, RealTimeProtectionEnabled, ProductStatus…).
+    // Returns nil when Defender is absent or WMI query fails.
+    // Mirrors WindowsDefender.cs from ComplianceApp.
+    bind_wmi_json_option(
+        lua,
+        host,
+        state,
+        "windows_defender_status",
+        "ep:windows_defender_status",
+        ep::windows_defender_status,
+    )?;
 
     Ok(())
 }

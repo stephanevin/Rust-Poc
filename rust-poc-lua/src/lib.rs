@@ -126,6 +126,12 @@ mod credentialguard;
 // the Local Machine cert store, and event log 208/209 pairing. Deviation #39.
 #[cfg(windows)]
 mod cloud;
+// `ep` exposes 2 Endpoint Protection bindings: all AV products registered with
+// Windows Security Center (ROOT\SecurityCenter2\AntiVirusProduct + ProductState
+// bitmask decode) and Windows Defender runtime status
+// (ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus). Deviation #40.
+#[cfg(windows)]
+mod ep;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;
