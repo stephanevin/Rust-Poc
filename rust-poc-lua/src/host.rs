@@ -16,8 +16,8 @@ use mlua::{
 };
 
 use super::{
-    accounts, ad, bitlocker, credentialguard, gpo, net, regional, registry, software, tls, updates,
-    winver, wmi::Wmi, wnf, wts,
+    accounts, ad, bitlocker, cloud, credentialguard, gpo, net, regional, registry, software, tls,
+    updates, winver, wmi::Wmi, wnf, wts,
 };
 
 /// Canonical `host.errors()` key for any failure of
@@ -282,6 +282,7 @@ pub(super) fn install(
     install_accounts_bindings(lua, &host, &state)?;
     install_software_bindings(lua, &host, &state)?;
     install_updates_bindings(lua, &host, &state)?;
+    install_cloud_bindings(lua, &host, &state)?;
     install_hardening_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
@@ -1154,6 +1155,139 @@ fn install_updates_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResu
                         st.record_error("updates_sccm_updates", e);
                         Ok(Value::Nil)
                     }
+                }
+            })?,
+        )?;
+    }
+
+    Ok(())
+}
+
+// --- Cloud (Azure AD + MDM/Intune) ------------------------------------
+//
+// Deviation #39 (see CLAUDE.md):
+// - host.azure_ad_joined_status()  — NetGetAadJoinInformation + cert validity
+// - host.azure_ad_device_id()      — pszDeviceId from DSREG_JOIN_INFO
+// - host.mdm_status()              — WMI root\CIMV2\mdm + cert validity
+// - host.mdm_device_id()           — cert Subject CN
+// - host.mdm_co_management_flags() — registry DWORD
+// - host.mdm_sync_status()         — event log 208/209 pairing
+//
+// All six bindings respect the workspace contract: never raise, record
+// failures into host.errors(), return nil on failure.
+#[allow(clippy::too_many_lines)]
+fn install_cloud_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.azure_ad_joined_status() → "On" | "Off" | "CertificateIsNotValid" | nil
+    {
+        let s = state.clone();
+        host.set(
+            "azure_ad_joined_status",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match cloud::azure_ad_joined_status() {
+                    Ok(v) => Ok(Value::String(lua.create_string(v)?)),
+                    Err(e) => {
+                        st.record_error("azure_ad_joined_status", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.azure_ad_device_id() → string? (device GUID from DSREG_JOIN_INFO.pszDeviceId)
+    {
+        let s = state.clone();
+        host.set(
+            "azure_ad_device_id",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match cloud::azure_ad_device_id() {
+                    Ok(Some(v)) => Ok(Value::String(lua.create_string(&v)?)),
+                    Ok(None) => Ok(Value::Nil),
+                    Err(e) => {
+                        st.record_error("azure_ad_device_id", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.mdm_status() → "On" | "Off" | "CertificateIsNotValid" | nil
+    {
+        let s = state.clone();
+        host.set(
+            "mdm_status",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                let res = match st.wmi() {
+                    Ok(wmi) => cloud::mdm_status(wmi),
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Ok(v) => Ok(Value::String(lua.create_string(v)?)),
+                    Err(e) => {
+                        st.record_error("mdm_status", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.mdm_device_id() → string? (CN subject of MDM provisioning cert)
+    {
+        let s = state.clone();
+        host.set(
+            "mdm_device_id",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                let res = match st.wmi() {
+                    Ok(wmi) => cloud::mdm_device_id(wmi),
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Ok(Some(v)) => Ok(Value::String(lua.create_string(&v)?)),
+                    Ok(None) => Ok(Value::Nil),
+                    Err(e) => {
+                        st.record_error("mdm_device_id", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.mdm_co_management_flags() → string? (ConfigInfo DWORD as decimal)
+    // No error recording needed: the function is infallible (absent key → None).
+    host.set(
+        "mdm_co_management_flags",
+        lua.create_function(move |lua, ()| {
+            match cloud::mdm_co_management_flags() {
+                Some(v) => Ok(Value::String(lua.create_string(&v)?)),
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    // host.mdm_sync_status() → { last_sync_date?, last_success_sync_date?,
+    //                             last_sync_result? }?
+    {
+        let s = state.clone();
+        host.set(
+            "mdm_sync_status",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match cloud::mdm_sync_status() {
+                    Some(sync) => match serde_json::to_value(&sync) {
+                        Ok(v) => Ok(lua_to_value_or_nil(lua, &mut st, "mdm_sync_status", &v)),
+                        Err(e) => {
+                            st.record_error("mdm_sync_status:serialize", e.to_string());
+                            Ok(Value::Nil)
+                        }
+                    },
+                    None => Ok(Value::Nil),
                 }
             })?,
         )?;

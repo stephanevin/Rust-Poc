@@ -74,7 +74,7 @@ structure of `sdh-fleet-client`:
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 58 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software, system updates, BitLocker, Credential Guard, Event Log). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 64 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software, system updates, BitLocker, Credential Guard, Event Log, Cloud/AzureAD+MDM). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
 | **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
@@ -218,7 +218,7 @@ rust-poc-lua/src/
 ├── lib.rs              # Public API + non-Windows stub
 ├── runtime.rs          # InternalRuntime::run — async, tokio::spawn_blocking + timeout
 ├── sandbox.rs          # Strips io/dofile/require/etc. globals
-├── host.rs             # 58 `host.*` bindings + HostState (Rc<RefCell<..>>)
+├── host.rs             # 64 `host.*` bindings + HostState (Rc<RefCell<..>>)
 ├── wmi.rs              # COMLibrary + per-namespace cache (root\cimv2, root\ccm, FVE, DeviceGuard)
 ├── registry.rs         # RegOpenKeyExW + RegQueryValueExW + RegEnumValueW + REG_* decode (incl. binary)
 ├── net.rs              # GetAdaptersAddresses + IPv4 enumeration
@@ -230,10 +230,11 @@ rust-poc-lua/src/
 ├── evt.rs              # EvtQuery + EvtNext + EvtRender wrapper — deviation #10, not in upstream
 ├── bitlocker.rs        # Win32_EncryptableVolume + ExecMethod + recovery-key events — deviation #10/#32-#37, not in upstream
 ├── credentialguard.rs  # Win32_DeviceGuard + derived booleans — deviation #10/#38, not in upstream
+├── cloud.rs            # NetGetAadJoinInformation + WMI root\CIMV2\mdm + cert store + event 208/209 — deviation #39, not in upstream
 └── ad.rs               # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 58 `host.*` bindings exposed to Lua
+### The 64 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -295,6 +296,12 @@ rust-poc-lua/src/
 | `host.bitlocker_escrowed_protector_ids(event_id)` **(deviation #37a)** | `EvtQuery + EvtRender` on `Microsoft-Windows-BitLocker/BitLocker Management` for `event_id` (783=AD, 845=AzureAD); lowercased `ProtectorGUID` values; mirrors `BitLockerService.EscrowedRecoveryKeyProtectorIdsFromEvents` | `array<string>?` |
 | `host.bitlocker_recovery_key_rotation_executed()` **(deviation #37b)** | Registry `ShutdownTime` (FILETIME) + events 864 (rotation) and 775 (key event, `ProtectorType=0x3`); three-state: `true`=rotation completed, `false`=in progress, `nil`=never rotated. Mirrors `BitLockerService.RecoveryKeyRotationFromEventsExecuted` | `bool?` |
 | `host.credential_guard_status()` **(deviation #38)** | WMI `Win32_DeviceGuard` in `root\Microsoft\Windows\DeviceGuard`; full 13-field row + two derived booleans (`is_credential_guard_configured`, `is_credential_guard_running`) computed in Rust mirroring `CredentialGuardStatus.Create` from `ComplianceApp.Shared` | `{...13 fields + 2 derived booleans}?` |
+| `host.azure_ad_joined_status()` **(deviation #39)** | `NetGetAadJoinInformation(NULL)` → `joinType` check + `validate_cert_context(pJoinCertificate)`; strictly better than C# registry+cert approach (cert embedded in struct, no secondary store lookup); mirrors `AzureAdJoinedStatus.cs` | `"On" \| "Off" \| "CertificateIsNotValid" \| nil` |
+| `host.azure_ad_device_id()` **(deviation #39)** | Same `NetGetAadJoinInformation` call → `pszDeviceId` (GUID string, no Subject-strip needed); mirrors `AzureAdDeviceId.cs` | `string?` |
+| `host.mdm_status()` **(deviation #39)** | WMI `root\CIMV2\mdm::MDM_MgmtAuthority.ProvisionedCertThumbprint` → `cert_in_lm_my` → `validate_cert_context`; `WBEM_E_INVALID_NAMESPACE` → `"Off"`; mirrors `MdmStatus.cs` | `"On" \| "Off" \| "CertificateIsNotValid" \| nil` |
+| `host.mdm_device_id()` **(deviation #39)** | Same WMI thumbprint → `CertGetNameStringW(CERT_NAME_SIMPLE_DISPLAY_TYPE)` → strip `"CN="`; mirrors `MdmDeviceId.cs` | `string?` |
+| `host.mdm_co_management_flags()` **(deviation #39)** | Registry `HKLM\SOFTWARE\Microsoft\DeviceManageabilityCSP\Provider\WMI_Bridge_Server\ConfigInfo` (DWORD → decimal string); `None` when key absent; mirrors `MdmCoManagementFlags.cs` | `string?` |
+| `host.mdm_sync_status()` **(deviation #39)** | EventID 208 (start; `Message1`=enrollment ID) × EventID 209 (end; `HRESULT`) paired by `(ProcessID, ThreadID)` from `<Execution …/>`, filtered on `CurrentEnrollmentId` registry value; mirrors `LastMdmSync{Date,Result,SuccessDate}.cs` | `{last_sync_date?, last_success_sync_date?, last_sync_result?}?` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -693,6 +700,66 @@ re-sync is mechanical.
     `subkey_names` / `try_subkey_names` and the imports
     (`RegEnumKeyExW`) they pull in, alongside the already-documented
     `enum_value_names` / `read_binary` (deviation #10).
+
+12. **`rust-poc-lua/src/cloud.rs` + `install_cloud_bindings` in
+    `host.rs` + `evt.rs` extension — six Cloud category bindings.**
+    Not in upstream. Implements the Cloud sub-tree of `Win10-Laptop.json`
+    (AzureAD join status and MDM/Intune enrollment). Deviation #39.
+
+    - `host.azure_ad_joined_status()` + `host.azure_ad_device_id()` —
+      Use `NetGetAadJoinInformation` (`netapi32.dll`) instead of the
+      C# approach (registry subkeys + separate cert-store lookup).
+      This is strictly better: `DSREG_JOIN_INFO.pJoinCertificate`
+      delivers the cert directly so no `CertOpenStore` call is needed
+      for AzureAD, and `pszDeviceId` is the raw GUID string so no
+      `Subject.Replace("CN=", "")` parsing is needed. `joinType` is
+      `DSREG_DEVICE_JOIN` (1) or `DSREG_WORKPLACE_JOIN` (2); anything
+      else maps to `"Off"`. `NetFreeAadJoinInformation` is called in
+      all paths via an RAII guard (`AadInfoGuard`).
+    - `host.mdm_status()` + `host.mdm_device_id()` — WMI
+      `root\CIMV2\mdm::MDM_MgmtAuthority.ProvisionedCertThumbprint`
+      → `cert_in_lm_my` → `CertFindCertificateInStore(CERT_FIND_SHA1_HASH)`.
+      `IsDeviceRegisteredWithManagement` (MDMRegistration.h) was
+      evaluated but rejected: it returns a `bool` only, cannot
+      distinguish `"On"` from `"CertificateIsNotValid"`.
+      `CertOpenStore` uses `CERT_STORE_PROV_SYSTEM` + the
+      `CERT_SYSTEM_STORE_LOCAL_MACHINE` flag — NOT `CertOpenSystemStoreW`
+      (which opens the Current User store). Thumbprint is hex-decoded
+      to a 20-byte SHA-1 hash blob.
+    - `host.mdm_co_management_flags()` — Registry DWORD; infallible
+      (absent key → `None`).
+    - `host.mdm_sync_status()` — EventID 208 (sync start; `Message1`
+      = enrollment ID; `ProcessID` + `ThreadID` from `<Execution …/>`)
+      paired with EventID 209 (sync end; `HRESULT`) across both MDM
+      channels. Pairing key is `(ProcessID, ThreadID)` read from
+      `EventRecord::system_attrs` and parsed to `u32` inside
+      `mdm_sync_status`. Filtered on
+      `HKLM\SOFTWARE\Microsoft\Provisioning\OMADM\Logger::CurrentEnrollmentId`.
+      Returns the most recent pair plus the most recent successful pair
+      (HRESULT top bit clear).
+
+    **Deviation #12a — `evt.rs` generic `system_attrs`:** `EventRecord`
+    exposes a flat `system_attrs: HashMap<String, String>` that collects
+    all attributes from every child element of `<System>` (e.g.
+    `"ProcessID"`, `"ThreadID"`, `"ActivityID"`, `"UserID"`). Values are
+    raw strings; callers parse them to the required type. This replaces
+    the former approach of storing typed `process_id: Option<u32>` /
+    `thread_id: Option<u32>` fields — those were MDM-specific knowledge
+    that did not belong in the generic `evt.rs` module. `cloud.rs` does
+    `.system_attrs.get("ProcessID").and_then(|s| s.parse::<u32>().ok())`
+    at the two pairing call sites. Non-breaking — `bitlocker.rs` never
+    read those fields and continues to read only `time_created` and
+    `event_data`.
+
+    **No new Cargo features.** `Win32_Security_Cryptography` (TLS,
+    deviation #14) covers all cert-store APIs. `Win32_NetworkManagement_NetManagement`
+    (accounts, deviation #19) already covers `netapi32.dll`. Both were
+    present before this deviation.
+
+    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve
+    `cloud.rs`, the `install_cloud_bindings` call in `install()`, and
+    the `system_attrs` field in `evt.rs::EventRecord` together with
+    `extract_system_attrs` + `scan_attrs_into`.
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is

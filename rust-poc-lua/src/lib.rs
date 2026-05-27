@@ -121,6 +121,11 @@ mod bitlocker;
 // and deriving two convenience booleans. Deviation #38.
 #[cfg(windows)]
 mod credentialguard;
+// `cloud` exposes the 6 Cloud category bindings (AzureAD join status + MDM/
+// Intune enrollment + MDM sync) via NetGetAadJoinInformation, WMI root\CIMV2\mdm,
+// the Local Machine cert store, and event log 208/209 pairing. Deviation #39.
+#[cfg(windows)]
+mod cloud;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

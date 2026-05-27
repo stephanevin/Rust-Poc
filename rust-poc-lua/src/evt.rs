@@ -1,10 +1,11 @@
-//! Windows Event Log (EvtQuery / EvtRender) queries with named
-//! `EventData/Data` extraction.
+//! Windows Event Log (EvtQuery / EvtRender) queries with structured XML
+//! extraction.
 //!
-//! Used by `bitlocker.rs` to read the
-//! `Microsoft-Windows-BitLocker/BitLocker Management` channel for events
-//! 783 (AD backup), 845 (Azure AD backup), 864 (recovery-key rotation),
-//! and 775 (key event with `ProtectorType`).
+//! Generic consumers of this module:
+//! - `bitlocker.rs` — reads `Microsoft-Windows-BitLocker/BitLocker Management`
+//!   for backup and key-rotation events.
+//! - `cloud.rs` — reads MDM-Admin and MDM-Sync channels for sync status events
+//!   (pairs EventID 208/209 via `system_attrs["ProcessID"]`/`["ThreadID"]`).
 //!
 //! ## Design
 //!
@@ -12,8 +13,8 @@
 //! The alternative — `EvtCreateRenderContext` + `EvtRenderEventValues` —
 //! is faster but requires hard-coding every value path up front; the XML
 //! route keeps the binding generic over `<Data Name="X">Y</Data>` shapes
-//! and remains plenty fast for the handful of events BitLocker writes
-//! (typically < 50 lifetime entries per channel).
+//! and remains plenty fast for the small number of events these channels
+//! typically accumulate (< 50–100 lifetime entries per channel).
 //!
 //! ## Mirror in `ComplianceApp`
 //!
@@ -62,6 +63,16 @@ pub(super) struct EventRecord {
     /// fractional-second precision varies by provider and we leave any
     /// downstream normalisation to the caller.
     pub time_created: String,
+    /// Raw attributes collected from every child element of `<System>`,
+    /// keyed by attribute name (e.g. `"ProcessID"`, `"ThreadID"`,
+    /// `"ActivityID"`, `"UserID"`, `"Name"`, `"Guid"`, …).
+    ///
+    /// Values are stored as raw strings — the caller is responsible for
+    /// parsing to any required numeric or structured type.  This keeps
+    /// `evt.rs` free of consumer-specific knowledge (e.g. MDM needs
+    /// `ProcessID`/`ThreadID` as `u32` for sync-event pairing; BitLocker
+    /// never reads these fields at all).
+    pub system_attrs: HashMap<String, String>,
     /// `<EventData>/<Data Name="X">Y</Data>` pairs.  Empty when the
     /// event has no named user-data.
     pub event_data: HashMap<String, String>,
@@ -77,9 +88,8 @@ pub(super) struct EventRecord {
 ///   `System`); harmless on dedicated channels.
 /// - `since` — optional ISO 8601 lower bound on `TimeCreated`.
 /// - `descending` — when `true`, returns events newest-first
-///   (`EvtQueryReverseDirection`).  Required by
-///   `bitlocker::recovery_key_rotation_executed` which wants the most
-///   recent event first.
+///   (`EvtQueryReverseDirection`).  Used by consumers that only need
+///   the most recent matching event (e.g. key-rotation checks).
 ///
 /// Returns `Ok(vec![])` when the channel exists but has no matching
 /// events.  Returns `Err` only on `EvtQuery` failures (channel does not
@@ -272,25 +282,128 @@ fn render_event(event: EVT_HANDLE) -> Option<EventRecord> {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal XML scanner — extracts TimeCreated@SystemTime and EventData/Data[@Name]
+// Minimal XML scanner — extracts TimeCreated@SystemTime, System child
+// element attributes, and EventData/Data[@Name] values.
 // ---------------------------------------------------------------------------
 
 /// Parses an `EvtRenderEventXml` payload into an `EventRecord`.
 ///
-/// Two extractions only:
-/// - `<TimeCreated SystemTime="..." …/>` (inside `<System>`)
-/// - every `<Data Name="X">Y</Data>` inside `<EventData>`
+/// Three extractions:
+/// - `<TimeCreated SystemTime="..." …/>` (inside `<System>`) → `time_created`
+/// - all attributes on every child element of `<System>` (flattened by
+///   attribute name) → `system_attrs`
+/// - every `<Data Name="X">Y</Data>` inside `<EventData>` → `event_data`
 ///
 /// The scanner is deliberately ad-hoc — pulling in `quick-xml` would
-/// add a runtime dependency for what is, structurally, two well-known
-/// patterns emitted by a single Microsoft provider.
+/// add a runtime dependency for what is, structurally, a handful of
+/// well-known patterns emitted by a small set of Microsoft providers.
 fn parse_event_xml(xml: &str) -> EventRecord {
     let time_created = extract_attribute(xml, "TimeCreated", "SystemTime").unwrap_or_default();
+    let system_attrs = extract_system_attrs(xml);
     let event_data = extract_event_data(xml);
     EventRecord {
         time_created,
+        system_attrs,
         event_data,
     }
+}
+
+/// Collects all attributes from every child element of `<System>` into a
+/// flat map keyed by attribute name.
+///
+/// Attribute values are stored verbatim as `String` — callers parse them
+/// to the required type (e.g. `s.parse::<u32>().ok()` for numeric fields).
+///
+/// Accepts both `"` and `'` as the quoting character (same rationale as
+/// [`extract_attribute`] and [`extract_event_data`]).
+fn extract_system_attrs(xml: &str) -> HashMap<String, String> {
+    let Some(sys_start) = xml.find("<System") else {
+        return HashMap::new();
+    };
+    let after_sys = &xml[sys_start..];
+    let Some(sys_end) = after_sys.find("</System>") else {
+        return HashMap::new();
+    };
+
+    let mut out = HashMap::new();
+    let mut rest = &after_sys[..sys_end];
+    while let Some(lt) = rest.find('<') {
+        rest = &rest[lt + 1..];
+        // Skip closing tags (</…) and XML declarations (<!…).
+        if matches!(rest.as_bytes().first(), Some(b'/' | b'!') | None) {
+            continue;
+        }
+        let Some(gt) = rest.find('>') else {
+            break;
+        };
+        let tag_body = &rest[..gt];
+        if let Some(attr_start) = tag_body.find(|c: char| c.is_ascii_whitespace()) {
+            scan_attrs_into(&tag_body[attr_start..], &mut out);
+        }
+        rest = &rest[gt + 1..];
+    }
+    out
+}
+
+/// Scans the attribute section of an opening tag (the text between the tag
+/// name and the closing `>`) and inserts every `name=QUOTE…QUOTE` pair into
+/// `out`.  Accepts both `"` and `'` as the quoting character.
+///
+/// Values are stored as raw strings; parsing (e.g. to `u32`) is left to the
+/// caller.  This function is a pure string scanner and never allocates beyond
+/// the entries it inserts into `out`.
+fn scan_attrs_into(src: &str, out: &mut HashMap<String, String>) {
+    let mut rest = src;
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.starts_with('/') {
+            break;
+        }
+        let name_end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != ':' && c != '-')
+            .unwrap_or(rest.len());
+        if name_end == 0 {
+            rest = rest.get(1..).unwrap_or_default();
+            continue;
+        }
+        let name = &rest[..name_end];
+        let after_name = rest[name_end..].trim_start();
+        let Some(after_eq) = after_name.strip_prefix('=') else {
+            // No `=` after the name — malformed attribute (e.g. bare token
+            // like `disabled` or XML tronqué).  Advance `rest` past the name
+            // so the outer loop makes forward progress and does not spin.
+            rest = &rest[name_end..];
+            continue;
+        };
+        let after_eq_trimmed = after_eq.trim_start();
+        match parse_quoted_value(after_eq_trimmed) {
+            Some((value, remainder)) => {
+                out.insert(name.to_string(), value.to_string());
+                rest = remainder;
+            }
+            None if after_eq_trimmed.starts_with(['"', '\'']) => break,
+            None => {
+                // Unquoted value — advance one byte past `=` and keep scanning.
+                rest = after_eq.get(1..).unwrap_or_default();
+            }
+        }
+    }
+}
+
+/// Parses `QUOTE value QUOTE` at the start of `src` and returns the inner
+/// value plus the remainder after the closing quote.  Accepts `"` and `'`
+/// symmetrically — shared by [`scan_attrs_into`] and [`extract_quoted_value`].
+fn parse_quoted_value(src: &str) -> Option<(&str, &str)> {
+    let mut chars = src.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let inner = &src[quote.len_utf8()..];
+    let end = inner.find(quote)?;
+    let value = &inner[..end];
+    let remainder = &inner[end + quote.len_utf8()..];
+    Some((value, remainder))
 }
 
 /// Finds `<tag ... attr=QUOTE value QUOTE ...>` and returns the value.
@@ -430,14 +543,7 @@ fn extract_quoted_value(haystack: &str, attr: &str) -> Option<String> {
         search_start = pos + 1;
     };
     let after_eq = &haystack[after_eq_start..];
-    let mut chars = after_eq.chars();
-    let quote = chars.next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let inner = &after_eq[quote.len_utf8()..];
-    let end = inner.find(quote)?;
-    Some(inner[..end].to_string())
+    parse_quoted_value(after_eq).map(|(value, _)| value.to_string())
 }
 
 /// Converts a Rust `&str` to a NUL-terminated UTF-16 wide buffer
@@ -527,8 +633,14 @@ mod tests {
         let rec = parse_event_xml(SAMPLE_DOUBLE_QUOTED);
         assert_eq!(rec.time_created, "2024-01-15T10:30:00.1234567Z");
         assert_eq!(rec.event_data.len(), 2);
+        // SAMPLE_DOUBLE_QUOTED has no <Execution> tag — ProcessID/ThreadID absent.
+        assert!(!rec.system_attrs.contains_key("ProcessID"));
+        assert!(!rec.system_attrs.contains_key("ThreadID"));
     }
 
+    /// Regression — `SAMPLE_REAL_BITLOCKER_783` contains
+    /// `<Execution ProcessID='4728' ThreadID='3228'/>` (single-quoted).
+    /// The scanner must extract both as raw strings into `system_attrs`.
     #[test]
     fn parses_full_event_single_quoted_real_bitlocker() {
         let rec = parse_event_xml(SAMPLE_REAL_BITLOCKER_783);
@@ -538,6 +650,30 @@ mod tests {
             rec.event_data.get("ProtectorGUID").map(String::as_str),
             Some("{85a34f7b-7471-4a77-ae0a-85c72d4cb378}")
         );
+        assert_eq!(rec.system_attrs.get("ProcessID").map(String::as_str), Some("4728"));
+        assert_eq!(rec.system_attrs.get("ThreadID").map(String::as_str), Some("3228"));
+    }
+
+    /// `<Execution ProcessID="…" ThreadID="…"/>` with double-quoted
+    /// attributes (also valid per XML 1.0 §3.1).
+    #[test]
+    fn parses_execution_attributes_double_quoted() {
+        let xml = r#"<Event><System><TimeCreated SystemTime="2024-01-15T10:30:00Z"/><Execution ProcessID="1000" ThreadID="2000"/></System><EventData></EventData></Event>"#;
+        let rec = parse_event_xml(xml);
+        assert_eq!(rec.system_attrs.get("ProcessID").map(String::as_str), Some("1000"));
+        assert_eq!(rec.system_attrs.get("ThreadID").map(String::as_str), Some("2000"));
+    }
+
+    /// Non-numeric `ProcessID` and empty `ThreadID` — stored verbatim in
+    /// `system_attrs`.  The caller (e.g. `cloud.rs`) is responsible for
+    /// `.parse::<u32>().ok()` and will naturally get `None` for non-numeric
+    /// values.
+    #[test]
+    fn parses_execution_raw_strings_stored_verbatim() {
+        let xml = "<Event><System><Execution ProcessID='abc' ThreadID=''/></System></Event>";
+        let rec = parse_event_xml(xml);
+        assert_eq!(rec.system_attrs.get("ProcessID").map(String::as_str), Some("abc"));
+        assert_eq!(rec.system_attrs.get("ThreadID").map(String::as_str), Some(""));
     }
 
     /// An event with no `<EventData>` block — common for events that
@@ -548,6 +684,8 @@ mod tests {
         let rec = parse_event_xml(xml);
         assert_eq!(rec.time_created, "2024-01-15T10:30:00Z");
         assert!(rec.event_data.is_empty());
+        // No <Execution> tag → ProcessID absent from system_attrs.
+        assert!(!rec.system_attrs.contains_key("ProcessID"));
     }
 
     /// A bare `<Data>` element without `Name="..."` must be ignored —
@@ -690,6 +828,20 @@ mod tests {
         // breaks out of the loop cleanly.  The exact map content is
         // less important than the "no panic" guarantee.
         let _ = extract_event_data(xml);
+    }
+
+    /// A bare attribute *name* with no `=` (e.g. HTML-style boolean or
+    /// truncated XML) must **not** spin the scanner indefinitely.
+    ///
+    /// Before the fix, `scan_attrs_into` hit `continue` without advancing
+    /// `rest` when `strip_prefix('=')` failed, causing an infinite loop on
+    /// any malformed event XML.  This test would hang forever under the bug.
+    #[test]
+    fn scan_attrs_into_bare_name_without_equals_does_not_loop() {
+        let xml = "<Event><System><Execution disabled ProcessID='4728'/></System></Event>";
+        let rec = parse_event_xml(xml);
+        // `disabled` has no `=` → must be skipped; `ProcessID` must still be extracted.
+        assert_eq!(rec.system_attrs.get("ProcessID").map(String::as_str), Some("4728"));
     }
 
     // ----------------------------------------------------------------
