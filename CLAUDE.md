@@ -232,10 +232,11 @@ rust-poc-lua/src/
 ├── credentialguard.rs  # Win32_DeviceGuard + derived booleans — deviation #10/#38, not in upstream
 ├── cloud.rs            # NetGetAadJoinInformation + WMI root\CIMV2\mdm + cert store + event 208/209 — deviation #39, not in upstream
 ├── ep.rs               # ROOT\SecurityCenter2\AntiVirusProduct + ProductState decode + ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus — deviation #40, not in upstream
+├── firewall.rs         # ROOT\SecurityCenter2\FirewallProduct + root\StandardCimv2 MSFT_NetFirewallProfile/NetConnectionProfile + COM HNetCfg.FwProducts (INetFwProduct2) — deviation #42, not in upstream
 └── ad.rs               # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 66 `host.*` bindings exposed to Lua
+### The 69 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -305,6 +306,9 @@ rust-poc-lua/src/
 | `host.mdm_sync_status()` **(deviation #39)** | EventID 208 (start; `Message1`=enrollment ID) × EventID 209 (end; `HRESULT`) paired by `(ProcessID, ThreadID)` from `<Execution …/>`, filtered on `CurrentEnrollmentId` registry value; mirrors `LastMdmSync{Date,Result,SuccessDate}.cs` | `{last_sync_date?, last_success_sync_date?, last_sync_result?}?` |
 | `host.security_center_av_products()` **(deviation #40)** | WMI `ROOT\SecurityCenter2\AntiVirusProduct` `SELECT *`; decodes `ProductState` bitmask (status / signatures / owner) from `AntiVirusEnums.cs`; returns all products — Lua script filters by `name` (e.g. `"Sentinel Agent"` for SentinelOne); mirrors `SentinelOne.cs` + `AntiVirusEnums.cs` from ComplianceApp | `array<{name, state, signatures, owner, path?, product_state_raw}>` |
 | `host.windows_defender_status()` **(deviation #40)** | WMI `ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus` `SELECT *`; returns the single-row status object in WMI PascalCase (`AMServiceEnabled`, `AMRunningMode`, `AntivirusEnabled`, `RealTimeProtectionEnabled`, `ProductStatus`, …); `nil` when Defender absent / namespace unreachable; mirrors `WindowsDefender.cs::GetWindowsDefenderStatusFromCim()` | `{AMServiceEnabled, AMRunningMode, AntivirusEnabled, RealTimeProtectionEnabled, ProductStatus, …}?` |
+| `host.security_center_firewall_products()` **(deviation #42)** | WMI `ROOT\SecurityCenter2\FirewallProduct` `SELECT *`; decodes `ProductState` bitmask (status / owner) from `FirewallEnums.cs` (bit-for-bit copy of `AntiVirusEnums.cs`; no `SignatureStatus` nibble); ghost entries (empty `displayName`) dropped; mirrors `Firewall.cs::GetSecurityCenterFirewallProducts` | `array<{name, state, owner, path?, product_state_raw}>` |
+| `host.windows_defender_firewall_status()` **(deviation #42)** | WMI `root\StandardCimv2` — `MSFT_NetConnectionProfile.NetworkCategory` → active profile name (`"Domain"\|"Private"\|"Public"`, fallback `"Public"` off-network); `MSFT_NetFirewallProfile.Enabled` per profile; mirrors `Firewall.cs::GetWindowsDefenderFirewallStatus` | `{current_profile, status, domain_state, private_state, public_state}?` |
+| `host.net_fw_products()` **(deviation #42)** | COM `HNetCfg.FwProducts` (`CoCreateInstance(NetFwProducts)` → `INetFwProducts` → `INetFwProduct2`); 5-attempt retry; `RuleCategories` SAFEARRAY extracted from `VARIANT`; Lua derives per-category owners; mirrors `Firewall.cs::GetNetFwProducts` | `array<{name, path?, rule_categories: array<u32>}>` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -810,6 +814,57 @@ re-sync is mechanical.
 
     Re-sync impact: `Copy-Item` of `host.rs` MUST preserve `ep.rs`, the
     `install_ep_bindings` call in `install()`, and the `ep` module
+    declaration in `lib.rs`.
+
+14. **`rust-poc-lua/src/firewall.rs` + `install_firewall_bindings` in
+    `host.rs` + `mod firewall` in `lib.rs` — three Firewall bindings.**
+    Not in upstream.  Implements the Firewall sub-tree of `Win10-Laptop.json`
+    (minus `WfpFirewallView`, deferred to deviation #43).  Deviation #42.
+
+    - **#42a `host.security_center_firewall_products()`** — `SELECT * FROM FirewallProduct`
+      in `ROOT\SecurityCenter2`.  `FirewallEnums.cs` defines `FW_ProductStatus` as
+      a bit-for-bit copy of `AV_ProductStatus` from `AntiVirusEnums.cs`; only the
+      `Status` (bits 12-15) and `Owner` (bits 8-11) nibbles are decoded (the
+      `SignatureStatus` nibble is absent in `FirewallEnums.cs`).  Ghost entries with
+      an empty `displayName` are dropped.  The Lua script filters by `name` for
+      `"Sentinel Firewall"` (mirrors `SentinelOneFirewallStatus.cs`).
+
+    - **#42b `host.windows_defender_firewall_status()`** — Two `root\StandardCimv2`
+      queries:
+      - `MSFT_NetConnectionProfile.NetworkCategory` (uint32: 0=Public, 1=Private,
+        2=Domain) → `current_profile` string.  Fallback `"Public"` when the machine
+        has no active network connection (no rows returned) — documented invariant in
+        `Firewall.cs` L.196.
+      - `MSFT_NetFirewallProfile` — all rows; matched by `Name` field (case-insensitive)
+        for Domain / Private / Public; `Enabled` uint16 (0=Off, 1=On) decoded to
+        `"Off"` / `"On"` / `"Unknown"`.
+      Returns `{current_profile, status, domain_state, private_state, public_state}`.
+      Mirrors `Firewall.cs::GetWindowsDefenderFirewallStatus`.
+
+    - **#42c `host.net_fw_products()`** — COM `HNetCfg.FwProducts` via
+      `CoCreateInstance(&NetFwProducts, …, CLSCTX_INPROC_SERVER)` → `INetFwProducts`.
+      Includes a 5-attempt retry loop (1 s intervals) for transient COM init failures
+      during Windows Firewall service start-up — mirrors `Firewall.cs` L.33–79.
+      Per-product: `Item(i)` returns `INetFwProduct`; QI to `INetFwProduct2` to access
+      `RuleCategories`.  The `RuleCategories` property returns a `VARIANT` wrapping a
+      `SAFEARRAY` of `VT_I4` (OLE type `VT_ARRAY|VT_I4 = 8195`).  Extraction via
+      `SafeArrayGetLBound` / `SafeArrayGetUBound` / `SafeArrayGetElement` (all from
+      `Win32::System::Ole`; already a Cargo feature).  Category IDs: 0=BootTime,
+      1=Stealth, 2=Firewall, 3=ConSec — numeric values match the C#
+      `NET_FW_RULE_CATEGORY` enum.  The Lua `fw_category_owner(cat_id)` helper maps
+      each ID to the registered product name, defaulting to `"Windows Defender Firewall"`
+      when no product claims the category.
+      Requires new Cargo feature `Win32_NetworkManagement_WindowsFirewall`.
+      Mirrors `Firewall.cs::GetNetFwProducts`.
+
+    **`WfpFirewallView` exclusion.** The full WFP pipeline (`FwpmEngineOpen0`,
+    `FwpmFilterEnum0`, `FwpmNetEventEnum2`, provider/sublayer enrichment,
+    deduplication) is deferred to deviation #43.  The SAFEARRAY extraction
+    (`variant_safearray_i4`) implemented here is a self-contained building block
+    that will be reused by any future `VARIANT`-backed COM property.
+
+    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve `firewall.rs`, the
+    `install_firewall_bindings` call in `install()`, and the `firewall` module
     declaration in `lib.rs`.
 
 Everything else — module names, function bodies, comments, doc

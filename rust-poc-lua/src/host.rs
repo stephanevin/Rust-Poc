@@ -16,8 +16,8 @@ use mlua::{
 };
 
 use super::{
-    accounts, ad, bitlocker, cloud, credentialguard, ep, gpo, net, regional, registry, software,
-    tls, updates, winver, wmi::Wmi, wnf, wts,
+    accounts, ad, bitlocker, cloud, credentialguard, ep, firewall, gpo, net, regional, registry,
+    software, tls, updates, winver, wmi::Wmi, wnf, wts,
 };
 
 /// Canonical `host.errors()` key for any failure of
@@ -285,6 +285,7 @@ pub(super) fn install(
     install_cloud_bindings(lua, &host, &state)?;
     install_hardening_bindings(lua, &host, &state)?;
     install_ep_bindings(lua, &host, &state)?;
+    install_firewall_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -1583,6 +1584,78 @@ fn install_ep_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()
         "ep:windows_defender_status",
         ep::windows_defender_status,
     )?;
+
+    Ok(())
+}
+
+fn install_firewall_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.security_center_firewall_products() — WMI ROOT\SecurityCenter2\FirewallProduct.
+    // Returns every firewall product registered with Windows Security Center, with decoded
+    // ProductState bitmask (Status + Owner nibbles).  ProductState layout is bit-for-bit
+    // identical to AntiVirusProduct (FirewallEnums.cs mirrors AntiVirusEnums.cs).
+    // Lua filters by name for the specific product it needs (e.g. "Sentinel Firewall").
+    // Mirrors Firewall.cs::GetSecurityCenterFirewallProducts.
+    bind_wmi_json_array(
+        lua,
+        host,
+        state,
+        "security_center_firewall_products",
+        "fw:sc2_products",
+        firewall::security_center_firewall_products,
+    )?;
+
+    // host.windows_defender_firewall_status() — WMI root\StandardCimv2.
+    // Two queries: MSFT_NetConnectionProfile → current profile name, and
+    // MSFT_NetFirewallProfile → enabled state per Domain/Private/Public profile.
+    // Returns {current_profile, status, domain_state, private_state, public_state}.
+    // Mirrors Firewall.cs::GetWindowsDefenderFirewallStatus.
+    {
+        let s = state.clone();
+        host.set(
+            "windows_defender_firewall_status",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match st.wmi() {
+                    Ok(wmi) => match firewall::windows_defender_firewall_status(wmi) {
+                        Ok(v) => Ok(lua_to_value_or_nil(lua, &mut st, "fw:wd_status", &v)),
+                        Err(e) => {
+                            st.record_error("fw:wd_status", e);
+                            Ok(Value::Nil)
+                        }
+                    },
+                    Err(e) => {
+                        st.record_error("fw:wd_status", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.net_fw_products() — COM HNetCfg.FwProducts (INetFwProducts / INetFwProduct2).
+    // Enumerates products registered with Windows Firewall and their RuleCategories
+    // (0=BootTime, 1=Stealth, 2=Firewall, 3=ConSec).  Lua derives per-category owners.
+    // Includes 5-attempt retry on transient COM failures.
+    // Mirrors Firewall.cs::GetNetFwProducts.
+    {
+        let s = state.clone();
+        host.set(
+            "net_fw_products",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match firewall::net_fw_products() {
+                    Ok(rows) => {
+                        let value = serde_json::Value::Array(rows);
+                        Ok(lua_to_value_or_nil(lua, &mut st, "fw:net_fw_products", &value))
+                    }
+                    Err(e) => {
+                        st.record_error("fw:net_fw_products", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
 
     Ok(())
 }

@@ -132,6 +132,13 @@ mod cloud;
 // (ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus). Deviation #40.
 #[cfg(windows)]
 mod ep;
+// `firewall` exposes 3 Firewall bindings: Security Center firewall products
+// (ROOT\SecurityCenter2\FirewallProduct + ProductState bitmask decode),
+// Windows Defender Firewall status (root\StandardCimv2 MSFT_NetConnectionProfile +
+// MSFT_NetFirewallProfile), and HNetCfg.FwProducts COM enumeration
+// (INetFwProducts / INetFwProduct2 → RuleCategories). Deviation #42.
+#[cfg(windows)]
+mod firewall;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

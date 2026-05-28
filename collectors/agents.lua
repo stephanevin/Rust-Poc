@@ -1,6 +1,7 @@
--- Agents category collector — Cloud (AzureAD / MDM) + Endpoint Protection (EP).
+-- Agents category collector — Cloud (AzureAD / MDM) + Endpoint Protection (EP)
+--                              + Firewall (FW).
 --
--- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40):
+-- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42):
 --
 -- Cloud (deviation #39):
 --   AzureAdJoinedStatus.cs    → azure_ad_joined_status    ("On"/"Off"/"CertificateIsNotValid")
@@ -22,6 +23,18 @@
 -- as AntiVirusEnums.cs (done in ep.rs).  security_center_av_products is kept as
 -- a diagnostic field exposing all registered AV products.
 --
+-- Firewall (deviation #42 — WfpFirewallView excluded, deferred to deviation #43):
+--   SentinelOneFirewallStatus.cs           → sentinel_one_firewall_status
+--   WindowsDefenderFirewallStatus.cs       → windows_defender_firewall_status
+--   WindowsDefenderFirewallCurrentProfile  → windows_defender_firewall_current_profile
+--   WindowsDefenderFirewallDomainState     → windows_defender_firewall_domain_state
+--   WindowsDefenderFirewallPrivateState    → windows_defender_firewall_private_state
+--   WindowsDefenderFirewallPublicState     → windows_defender_firewall_public_state
+--   FirewallRuleCategoryBootTime           → firewall_rule_category_boot_time
+--   FirewallRuleCategoryFirewall           → firewall_rule_category_firewall
+--   FirewallRuleCategoryStealth            → firewall_rule_category_stealth
+--   FirewallRuleCategoryConSec             → firewall_rule_category_con_sec
+--
 -- Run via:
 --   cargo run -- agents.lua
 -- or:
@@ -42,7 +55,7 @@ function collect()
     if p.name == "Sentinel Agent" then sentinel_one = p; break end
   end
 
-  -- Windows Defender — keep only the 6 fields that Win10-Laptop.json
+  -- Windows Defender AV — keep only the 6 fields that Win10-Laptop.json
   -- exposes under WindowsDefender* items.  The raw MSFT_MpComputerStatus
   -- row has ~55 properties; the others are not part of the definition.
   local wd_fields = {
@@ -62,6 +75,37 @@ function collect()
     end
   end
 
+  -- Firewall (FW) — deviation #42 -------------------------------------------
+  -- SentinelOne firewall — mirrors SentinelOneFirewallStatus.cs which reads
+  -- ROOT\SecurityCenter2\FirewallProduct WHERE displayName = 'Sentinel Firewall'
+  -- and decodes the productState bitmask via FW_ProductStatus enum (same layout
+  -- as AV_ProductStatus in AntiVirusEnums.cs — done in firewall.rs).
+  local sc_fw = host.security_center_firewall_products() or {}
+  local sentinel_fw = nil
+  for _, p in ipairs(sc_fw) do
+    if p.name == "Sentinel Firewall" then sentinel_fw = p; break end
+  end
+
+  -- Windows Defender Firewall — MSFT_NetConnectionProfile + MSFT_NetFirewallProfile
+  -- (root\StandardCimv2).  Provides current_profile + per-profile Enabled states.
+  local wdfw = host.windows_defender_firewall_status()
+
+  -- HNetCfg.FwProducts — COM enumeration of products registered with Windows
+  -- Firewall and their RuleCategories arrays (INetFwProduct2).
+  -- fw_category_owner(cat_id) returns the display name(s) of the product(s)
+  -- owning that category, or "Windows Defender Firewall" when none is registered
+  -- (the default owner for unclaimed categories — mirrors Firewall.cs semantics).
+  local fw_products = host.net_fw_products() or {}
+  local function fw_category_owner(cat_id)
+    local names = {}
+    for _, p in ipairs(fw_products) do
+      for _, c in ipairs(p.rule_categories or {}) do
+        if c == cat_id then names[#names + 1] = p.name; break end
+      end
+    end
+    return #names == 0 and "Windows Defender Firewall" or table.concat(names, "\n")
+  end
+
   return {
     -- Cloud — AzureAD join status + MDM/Intune enrollment.
     azure_ad_joined_status     = host.azure_ad_joined_status(),
@@ -79,12 +123,33 @@ function collect()
     sentinel_one_anti_virus_status = sentinel_one and sentinel_one.state,
     sentinel_one_up_to_date        = sentinel_one and sentinel_one.signatures,
 
-    -- Windows Defender (from ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus).
+    -- Windows Defender AV (from ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus).
     -- Field names match Win10-Laptop.json WindowsDefender* items.
     windows_defender = windows_defender,
 
     -- Diagnostic: all Security Center AV products (ghost entries filtered in ep.rs).
     security_center_av_products = sc_av,
+
+    -- Firewall — SentinelOne (from ROOT\SecurityCenter2\FirewallProduct).
+    -- nil when Sentinel Firewall is not installed or not registered with Security Center.
+    sentinel_one_firewall_status = sentinel_fw and sentinel_fw.state,
+
+    -- Firewall — Windows Defender profile states (root\StandardCimv2).
+    windows_defender_firewall_status         = wdfw and wdfw.status,
+    windows_defender_firewall_current_profile = wdfw and wdfw.current_profile,
+    windows_defender_firewall_domain_state   = wdfw and wdfw.domain_state,
+    windows_defender_firewall_private_state  = wdfw and wdfw.private_state,
+    windows_defender_firewall_public_state   = wdfw and wdfw.public_state,
+
+    -- Firewall — rule category owners (HNetCfg.FwProducts via INetFwProduct2::RuleCategories).
+    -- Values mirror FirewallRuleCategory* items in Win10-Laptop.json.
+    firewall_rule_category_boot_time = fw_category_owner(0),
+    firewall_rule_category_stealth   = fw_category_owner(1),
+    firewall_rule_category_firewall  = fw_category_owner(2),
+    firewall_rule_category_con_sec   = fw_category_owner(3),
+
+    -- Diagnostic: all Security Center firewall products (ghost entries filtered in firewall.rs).
+    security_center_firewall_products = sc_fw,
 
     _errors = host.errors(),
   }
