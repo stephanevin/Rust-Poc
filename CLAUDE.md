@@ -233,10 +233,14 @@ rust-poc-lua/src/
 ├── cloud.rs            # NetGetAadJoinInformation + WMI root\CIMV2\mdm + cert store + event 208/209 — deviation #39, not in upstream
 ├── ep.rs               # ROOT\SecurityCenter2\AntiVirusProduct + ProductState decode + ROOT\Microsoft\Windows\Defender\MSFT_MpComputerStatus — deviation #40, not in upstream
 ├── firewall.rs         # ROOT\SecurityCenter2\FirewallProduct + root\StandardCimv2 MSFT_NetFirewallProfile/NetConnectionProfile + COM HNetCfg.FwProducts (INetFwProduct2) — deviation #42, not in upstream
+├── wfp_known_guids.rs  # OnceLock<HashMap<GUID,&str>> for 110+ layer, 17+ sublayer, ~100 condition-field GUIDs — deviation #43
+├── wfp_conditions.rs   # FWP_CONDITION_VALUE0 parser → WfpCondition; conditions_json() + format_compact() — deviation #43
+├── wfp.rs              # WfpEngine RAII, WfpMemoryGuard RAII, enumerate_wfp_state() (6 Win32 enums), wfp_net_events() — deviation #43
+├── wfp_pipeline.rs     # Port of WfpFilterPipeline.cs — ALE filter, shadowing, dedup, wfp_sublayer_details(), wfp_firewall_view() — deviation #43
 └── ad.rs               # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 69 `host.*` bindings exposed to Lua
+### The 72 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -309,6 +313,9 @@ rust-poc-lua/src/
 | `host.security_center_firewall_products()` **(deviation #42)** | WMI `ROOT\SecurityCenter2\FirewallProduct` `SELECT *`; decodes `ProductState` bitmask (status / owner) from `FirewallEnums.cs` (bit-for-bit copy of `AntiVirusEnums.cs`; no `SignatureStatus` nibble); ghost entries (empty `displayName`) dropped; mirrors `Firewall.cs::GetSecurityCenterFirewallProducts` | `array<{name, state, owner, path?, product_state_raw}>` |
 | `host.windows_defender_firewall_status()` **(deviation #42)** | WMI `root\StandardCimv2` — `MSFT_NetConnectionProfile.NetworkCategory` → active profile name (`"Domain"\|"Private"\|"Public"`, fallback `"Public"` off-network); `MSFT_NetFirewallProfile.Enabled` per profile; mirrors `Firewall.cs::GetWindowsDefenderFirewallStatus` | `{current_profile, status, domain_state, private_state, public_state}?` |
 | `host.net_fw_products()` **(deviation #42)** | COM `HNetCfg.FwProducts` (`CoCreateInstance(NetFwProducts)` → `INetFwProducts` → `INetFwProduct2`); 5-attempt retry; `RuleCategories` SAFEARRAY extracted from `VARIANT`; Lua derives per-category owners; mirrors `Firewall.cs::GetNetFwProducts` | `array<{name, path?, rule_categories: array<u32>}>` |
+| `host.wfp_sublayer_details()` **(deviation #43)** | All WFP filters grouped by sublayer, sorted `sublayer_weight DESC` per group then `layer_name ASC / effective_weight DESC`; enriched with provider/layer/sublayer names; shares `WfpState` cache with #43 siblings; mirrors `WfpSubLayerDetails.cs` | `array<{sublayer_key, sublayer_name, total_filters, weight, wfp_filter_details[]}>` — fields named so that `sublayer_*` sorts before the large `wfp_filter_details` array under serde_json BTreeMap ordering |
+| `host.wfp_firewall_view()` **(deviation #43)** | ALE-filtered + shadowed + deduplicated firewall view; three pipeline steps from `WfpFilterPipeline.cs`; compact Unicode-symbol condition strings; sorted by direction / sublayer weight / effective weight; mirrors `WfpFirewallView.cs` | `array<{order_id, direction, name, provider_name, layer_name_normalized, sublayer_name, action, has_clear_action_right, conditions, conditions_json, variant_details[]}>` |
+| `host.wfp_net_events()` **(deviation #43)** | Up to 1 000 recent WFP net events via `FwpmNetEventEnum2` using an **ephemeral** engine; enriched from the shared `WfpState` cache (`filter_index`, `layer_id_index`); sorted timestamp DESC; `layerId < 200` heuristic omitted (intentional deviation); mirrors `WfpNetEvents.cs` | `array<{timestamp, direction, event_type, protocol_name, local_address, local_port, remote_address, remote_port, app_id, filter_id, filter_name, sublayer_name}>` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -857,15 +864,59 @@ re-sync is mechanical.
       Requires new Cargo feature `Win32_NetworkManagement_WindowsFirewall`.
       Mirrors `Firewall.cs::GetNetFwProducts`.
 
-    **`WfpFirewallView` exclusion.** The full WFP pipeline (`FwpmEngineOpen0`,
-    `FwpmFilterEnum0`, `FwpmNetEventEnum2`, provider/sublayer enrichment,
-    deduplication) is deferred to deviation #43.  The SAFEARRAY extraction
-    (`variant_safearray_i4`) implemented here is a self-contained building block
-    that will be reused by any future `VARIANT`-backed COM property.
-
     Re-sync impact: `Copy-Item` of `host.rs` MUST preserve `firewall.rs`, the
     `install_firewall_bindings` call in `install()`, and the `firewall` module
     declaration in `lib.rs`.
+
+15. **`rust-poc-lua/src/wfp*.rs` + `install_wfp_bindings` in `host.rs` +
+    `WfpCacheState` on `HostState` — three WFP Lua bindings.**
+    Not in upstream.  Implements `WfpSubLayerDetails.cs`, `WfpFirewallView.cs`,
+    and `WfpNetEvents.cs` from ComplianceApp with full logic fidelity (snake_case
+    field names, same enrichment, deduplication, and condition formatting).
+    Deviation #43.
+
+    **Four new modules:**
+
+    - **`wfp_known_guids.rs`** — three `OnceLock<HashMap<GUID, &str>>` for 110+
+      layer GUIDs, 17+ sublayer GUIDs, and ~100 condition-field GUIDs.  GUIDs from
+      `WfpKnownGuids.cs` (Windows SDK headers `fwpmu.h`, 10.0.26100.0).
+
+    - **`wfp_conditions.rs`** — intermediate `WfpCondition` type; parses
+      `FWP_CONDITION_VALUE0` union for all `FWP_DATA_TYPE` variants (inline scalars,
+      heap-pointer scalars, `BYTE_BLOB`, `SID`, security-descriptor, masks, ranges);
+      produces JSON array (`conditions_json`) and compact Unicode-symbol string
+      (`format_compact`).
+
+    - **`wfp.rs`** — `WfpEngine(HANDLE)` RAII (`FwpmEngineClose0`);
+      `WfpMemoryGuard` RAII (`FwpmFreeMemory0`); `enumerate_wfp_state()` (six Win32
+      enumeration APIs at batch 1000/1000/1000/1000/1000/10000); `WfpEnrichedFilter`
+      + `WfpState` cached structs; `wfp_net_events()` using an ephemeral engine +
+      `FwpmNetEventEnum2(1000)`.  Custom FILETIME→ISO 8601 UTC via Howard Hinnant's
+      civil-date algorithm (no external crate).
+
+    - **`wfp_pipeline.rs`** — port of `WfpFilterPipeline.cs`:
+      `filter_ale_filters` (ALE layer keep-list, sublayer exclusions, action
+      exclusions, SentinelOne name filter); `compute_shadowing` (tri-sort +
+      shadowing mark); `deduplicate_filters` (group by 5-tuple key, representative
+      by max `effective_weight_numeric`); `normalize_layer_name` (strips `_V4`/`_V6`
+      suffix for dedup key only); `wfp_sublayer_details` + `wfp_firewall_view`.
+
+    **`HostState` additions:**
+    - `WfpCacheState` tri-state enum (`NotInit | Ready(WfpState) | Failed`).
+    - `wfp_cache: WfpCacheState` field, initialised `NotInit`.
+    - `ensure_wfp_state() -> Option<&WfpState>` accessor (same memo pattern as
+      `ensure_updates_cache`); memoises failures under
+      `ERR_KEY_WFP_CACHE_INIT = "wfp:cache_init"`.
+
+    **Intentional deviation from ComplianceApp:**  `wfp_net_events` omits the
+    `layerId < 200` heuristic guard (ComplianceApp adds it to filter corrupted
+    event data but it silently drops events from third-party/dynamic layers).
+
+    Requires new Cargo feature `Win32_NetworkManagement_WindowsFilteringPlatform`.
+
+    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve all four `wfp*` module
+    declarations in `lib.rs`, the `install_wfp_bindings` call in `install()`, and
+    the `WfpCacheState` + `wfp_cache` additions to `HostState`.
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is
@@ -885,7 +936,8 @@ Copy-Item -Force `
   C:\Users\Vin\source\repos\Rust-Poc\rust-poc-lua\src\host.rs
 
 # lib.rs needs hand-merging because of deviation #4 (the broken doc-link
-# would come back). The other 9 files are all safe to overwrite.
+# would come back). The other files are safe to overwrite (host.rs also
+# needs hand-merging to preserve the wfp_cache and ensure_wfp_state additions).
 ```
 
 After a re-sync: `cargo check -p rust-poc-lua` + `cargo clippy -p

@@ -139,6 +139,29 @@ mod ep;
 // (INetFwProducts / INetFwProduct2 → RuleCategories). Deviation #42.
 #[cfg(windows)]
 mod firewall;
+// `wfp_known_guids` holds three lazily-initialised `HashMap<GUID, &str>` maps
+// (layer GUIDs 110+, sublayer GUIDs 17+, condition field GUIDs ~100).
+// Consumed by `wfp_conditions` and `wfp` for human-readable enrichment.
+// Deviation #43.
+#[cfg(windows)]
+mod wfp_known_guids;
+// `wfp_conditions` parses raw `FWPM_FILTER_CONDITION0[]` arrays into the
+// intermediate `WfpCondition` type and serialises them as a JSON array
+// (`conditions_json`) or a compact Unicode-symbol string (`format_compact`).
+// Deviation #43.
+#[cfg(windows)]
+mod wfp_conditions;
+// `wfp` provides two RAII types (`WfpEngine`, `WfpMemoryGuard`), the
+// `WfpEnrichedFilter` / `WfpState` structs, `enumerate_wfp_state()` (six
+// Win32 enumeration APIs), and `wfp_net_events()` (ephemeral engine +
+// FwpmNetEventEnum2). Deviation #43.
+#[cfg(windows)]
+mod wfp;
+// `wfp_pipeline` ports `WfpFilterPipeline.cs`: ALE filter, shadowing logic,
+// deduplication grouping, and the two views `wfp_sublayer_details` /
+// `wfp_firewall_view`. Deviation #43.
+#[cfg(windows)]
+mod wfp_pipeline;
 
 #[cfg(windows)]
 pub use runtime::InternalRuntime;

@@ -1,7 +1,7 @@
 -- Agents category collector — Cloud (AzureAD / MDM) + Endpoint Protection (EP)
---                              + Firewall (FW).
+--                              + Firewall (FW) + WFP.
 --
--- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42):
+-- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42 + #43):
 --
 -- Cloud (deviation #39):
 --   AzureAdJoinedStatus.cs    → azure_ad_joined_status    ("On"/"Off"/"CertificateIsNotValid")
@@ -23,7 +23,7 @@
 -- as AntiVirusEnums.cs (done in ep.rs).  security_center_av_products is kept as
 -- a diagnostic field exposing all registered AV products.
 --
--- Firewall (deviation #42 — WfpFirewallView excluded, deferred to deviation #43):
+-- Firewall (deviation #42):
 --   SentinelOneFirewallStatus.cs           → sentinel_one_firewall_status
 --   WindowsDefenderFirewallStatus.cs       → windows_defender_firewall_status
 --   WindowsDefenderFirewallCurrentProfile  → windows_defender_firewall_current_profile
@@ -34,6 +34,11 @@
 --   FirewallRuleCategoryFirewall           → firewall_rule_category_firewall
 --   FirewallRuleCategoryStealth            → firewall_rule_category_stealth
 --   FirewallRuleCategoryConSec             → firewall_rule_category_con_sec
+--
+-- WFP (deviation #43):
+--   WfpSubLayerDetails.cs → wfp_sublayer_details (sublayer groups, all filters)
+--   WfpFirewallView.cs    → wfp_firewall_view    (ALE-filtered, shadowed, deduped)
+--   WfpNetEvents.cs       → wfp_net_events       (latest 1000 net events, timestamp DESC)
 --
 -- Run via:
 --   cargo run -- agents.lua
@@ -150,6 +155,12 @@ function collect()
 
     -- Diagnostic: all Security Center firewall products (ghost entries filtered in firewall.rs).
     security_center_firewall_products = sc_fw,
+
+    -- WFP (deviation #43) — all three consume the shared WfpState cache
+    -- (enumerate_wfp_state is called at most once per run).
+    wfp_sublayer_details = host.wfp_sublayer_details(),
+    wfp_firewall_view    = host.wfp_firewall_view(),
+    wfp_net_events       = host.wfp_net_events(),
 
     _errors = host.errors(),
   }

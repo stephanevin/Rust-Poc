@@ -17,7 +17,7 @@ use mlua::{
 
 use super::{
     accounts, ad, bitlocker, cloud, credentialguard, ep, firewall, gpo, net, regional, registry,
-    software, tls, updates, winver, wmi::Wmi, wnf, wts,
+    software, tls, updates, wfp, wfp_pipeline, winver, wmi::Wmi, wnf, wts,
 };
 
 /// Canonical `host.errors()` key for any failure of
@@ -32,6 +32,11 @@ const ERR_KEY_WUA_CACHE_INIT: &str = "updates:wua_cache_init";
 /// `updates_managed_by` surface the same diagnostic regardless of which
 /// one triggered the init.
 const ERR_KEY_AU_SERVICE: &str = "updates:au_service";
+
+/// Canonical `host.errors()` key for any failure of
+/// [`wfp::enumerate_wfp_state`].  All three WFP bindings surface the same
+/// diagnostic to avoid duplicating the expensive init error.
+const ERR_KEY_WFP_CACHE_INIT: &str = "wfp:cache_init";
 
 /// Tri-state cache for the shared WUA offline payload.
 ///
@@ -82,6 +87,18 @@ pub(super) enum AuServiceState {
     Failed,
 }
 
+/// Tri-state cache for the WFP enriched state (layers, sublayers, providers,
+/// provider contexts, callouts, and enriched filters).
+///
+/// Mirrors the pattern of [`UpdatesCacheState`]: the expensive
+/// `enumerate_wfp_state()` call is executed at most once per run, and any
+/// init failure is memoised so the other two WFP bindings do not retry.
+pub(super) enum WfpCacheState {
+    NotInit,
+    Ready(wfp::WfpState),
+    Failed,
+}
+
 /// Per-run mutable state passed into binding closures. Lua is !Send, so
 /// this lives on the blocking thread that owns the Lua VM.
 pub(super) struct HostState {
@@ -109,6 +126,12 @@ pub(super) struct HostState {
     /// memoised in [`AuServiceState::Failed`] to avoid repeated COM
     /// round-trips.
     pub au_service: AuServiceState,
+    /// Cache of the full WFP enriched state (layers, sublayers, providers,
+    /// provider contexts, callouts, filters), populated lazily on the first
+    /// WFP binding call.  All three bindings share the same `WfpState`; init
+    /// failures are memoised so the expensive enumeration is never retried
+    /// within the same run.
+    pub wfp_cache: WfpCacheState,
     pub errors: HashMap<String, String>,
 }
 
@@ -121,6 +144,7 @@ impl HostState {
             wmi: None,
             updates_cache: UpdatesCacheState::NotInit,
             au_service: AuServiceState::NotInit,
+            wfp_cache: WfpCacheState::NotInit,
             errors: HashMap::new(),
         }
     }
@@ -233,6 +257,30 @@ impl HostState {
             AuServiceState::Ready(None) | AuServiceState::NotInit | AuServiceState::Failed => None,
         }
     }
+
+    /// Lazy-init accessor for the WFP enriched state.
+    ///
+    /// The enumeration is performed at most once per run. Any init failure
+    /// is memoised in [`WfpCacheState::Failed`] so the three WFP bindings
+    /// never retry the expensive Win32 enumeration calls.  A single
+    /// canonical error is recorded under [`ERR_KEY_WFP_CACHE_INIT`].
+    fn ensure_wfp_state(&mut self) -> Option<&wfp::WfpState> {
+        if matches!(self.wfp_cache, WfpCacheState::NotInit) {
+            match wfp::enumerate_wfp_state() {
+                Ok(s) => self.wfp_cache = WfpCacheState::Ready(s),
+                Err(e) => {
+                    self.wfp_cache = WfpCacheState::Failed;
+                    if !self.errors.contains_key(ERR_KEY_WFP_CACHE_INIT) {
+                        self.errors.insert(ERR_KEY_WFP_CACHE_INIT.to_string(), e);
+                    }
+                }
+            }
+        }
+        match &self.wfp_cache {
+            WfpCacheState::Ready(s) => Some(s),
+            WfpCacheState::NotInit | WfpCacheState::Failed => None,
+        }
+    }
 }
 
 /// Shared handle to `HostState`. We wrap in `Rc<RefCell<..>>` so every Lua
@@ -286,6 +334,7 @@ pub(super) fn install(
     install_hardening_bindings(lua, &host, &state)?;
     install_ep_bindings(lua, &host, &state)?;
     install_firewall_bindings(lua, &host, &state)?;
+    install_wfp_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -1326,11 +1375,9 @@ fn install_cloud_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult
     // No error recording needed: the function is infallible (absent key → None).
     host.set(
         "mdm_co_management_flags",
-        lua.create_function(move |lua, ()| {
-            match cloud::mdm_co_management_flags() {
-                Some(v) => Ok(Value::String(lua.create_string(&v)?)),
-                None => Ok(Value::Nil),
-            }
+        lua.create_function(move |lua, ()| match cloud::mdm_co_management_flags() {
+            Some(v) => Ok(Value::String(lua.create_string(&v)?)),
+            None => Ok(Value::Nil),
         })?,
     )?;
 
@@ -1407,29 +1454,26 @@ fn install_hardening_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRe
         let s = state.clone();
         host.set(
             "bitlocker_key_protector_ids",
-            lua.create_function(
-                move |lua, (mount_point, protector_type): (String, u32)| {
-                    let mut st = s.borrow_mut();
-                    let field =
-                        format!("bitlocker_key_protector_ids:{mount_point}:{protector_type}");
-                    let res = match st.wmi() {
-                        Ok(wmi) => bitlocker::key_protector_ids(wmi, &mount_point, protector_type),
-                        Err(e) => Err(e),
-                    };
-                    match res {
-                        Ok(ids) => {
-                            let arr: Vec<serde_json::Value> =
-                                ids.into_iter().map(serde_json::Value::String).collect();
-                            let value = serde_json::Value::Array(arr);
-                            Ok(lua_to_value_or_nil(lua, &mut st, &field, &value))
-                        }
-                        Err(e) => {
-                            st.record_error(&field, e);
-                            Ok(Value::Nil)
-                        }
+            lua.create_function(move |lua, (mount_point, protector_type): (String, u32)| {
+                let mut st = s.borrow_mut();
+                let field = format!("bitlocker_key_protector_ids:{mount_point}:{protector_type}");
+                let res = match st.wmi() {
+                    Ok(wmi) => bitlocker::key_protector_ids(wmi, &mount_point, protector_type),
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Ok(ids) => {
+                        let arr: Vec<serde_json::Value> =
+                            ids.into_iter().map(serde_json::Value::String).collect();
+                        let value = serde_json::Value::Array(arr);
+                        Ok(lua_to_value_or_nil(lua, &mut st, &field, &value))
                     }
-                },
-            )?,
+                    Err(e) => {
+                        st.record_error(&field, e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
         )?;
     }
 
@@ -1539,9 +1583,12 @@ fn install_hardening_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRe
                     Err(e) => Err(e),
                 };
                 match res {
-                    Ok(Some(v)) => {
-                        Ok(lua_to_value_or_nil(lua, &mut st, "credential_guard_status", &v))
-                    }
+                    Ok(Some(v)) => Ok(lua_to_value_or_nil(
+                        lua,
+                        &mut st,
+                        "credential_guard_status",
+                        &v,
+                    )),
                     Ok(None) => Ok(Value::Nil),
                     Err(e) => {
                         st.record_error("credential_guard_status", e);
@@ -1646,11 +1693,106 @@ fn install_firewall_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
                 match firewall::net_fw_products() {
                     Ok(rows) => {
                         let value = serde_json::Value::Array(rows);
-                        Ok(lua_to_value_or_nil(lua, &mut st, "fw:net_fw_products", &value))
+                        Ok(lua_to_value_or_nil(
+                            lua,
+                            &mut st,
+                            "fw:net_fw_products",
+                            &value,
+                        ))
                     }
                     Err(e) => {
                         st.record_error("fw:net_fw_products", e);
                         Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    Ok(())
+}
+
+// --- WFP bindings (deviation #43) -----------------------------------
+
+fn install_wfp_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.wfp_sublayer_details() — all enriched WFP filters grouped by
+    // sublayer, sorted sublayer_weight DESC inside each group
+    // layer_name ASC / effective_weight_numeric DESC.
+    // Mirrors WfpSubLayerDetails.cs.
+    {
+        let s = state.clone();
+        host.set(
+            "wfp_sublayer_details",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match st.ensure_wfp_state() {
+                    Some(wfp_state) => {
+                        let value = wfp_pipeline::wfp_sublayer_details(&wfp_state.filters);
+                        lua.to_value(&value).map_err(|e| {
+                            mlua::Error::runtime(format!("wfp_sublayer_details serialize: {e}"))
+                        })
+                    }
+                    None => Ok(Value::Nil),
+                }
+            })?,
+        )?;
+    }
+
+    // host.wfp_firewall_view() — ALE-filtered, shadowed, deduplicated
+    // firewall view.  Three pipeline steps: ALE filter → shadowing → dedup.
+    // Mirrors WfpFirewallView.cs + WfpFilterPipeline.cs.
+    {
+        let s = state.clone();
+        host.set(
+            "wfp_firewall_view",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match st.ensure_wfp_state() {
+                    Some(wfp_state) => {
+                        let value = wfp_pipeline::wfp_firewall_view(&wfp_state.filters);
+                        lua.to_value(&value).map_err(|e| {
+                            mlua::Error::runtime(format!("wfp_firewall_view serialize: {e}"))
+                        })
+                    }
+                    None => Ok(Value::Nil),
+                }
+            })?,
+        )?;
+    }
+
+    // host.wfp_net_events() — most-recent WFP network events (up to 1000),
+    // sorted timestamp DESC.  Opens an ephemeral engine and enumerates via
+    // FwpmNetEventEnum2; enriches each event from the shared WfpState.
+    // Mirrors WfpNetEvents.cs.  On FWP_NET_EVENTS_DISABLED returns [] silently
+    // (collection being off is a normal state, not an error).  Any other Win32
+    // failure returns [] and records the error under "wfp:net_events".
+    // Does NOT poison the WfpState cache.
+    //
+    // Borrow note: `ensure_wfp_state()` returns `Option<&WfpState>` tied to
+    // `st`.  We resolve the reference inside a block so the borrow is dropped
+    // before the `Err` arm tries to call `st.record_error(...)`.
+    {
+        let s = state.clone();
+        host.set(
+            "wfp_net_events",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                // Separate the borrow of `st` (via `ensure_wfp_state`) from
+                // the potential mutable borrow in `record_error`.  `wfp_result`
+                // is an owned `Option<Result<…>>`, so the `wfp_state` borrow
+                // ends before the `Err` arm calls `st.record_error`.
+                let wfp_result = st.ensure_wfp_state().map(wfp::wfp_net_events);
+                match wfp_result {
+                    None => Ok(Value::Nil),
+                    Some(Ok(value)) => lua.to_value(&value).map_err(|e| {
+                        mlua::Error::runtime(format!("wfp_net_events serialize: {e}"))
+                    }),
+                    Some(Err(e)) => {
+                        st.record_error("wfp:net_events", e);
+                        let empty = serde_json::json!([]);
+                        lua.to_value(&empty).map_err(|e2| {
+                            mlua::Error::runtime(format!("wfp_net_events empty serialize: {e2}"))
+                        })
                     }
                 }
             })?,
@@ -2273,10 +2415,6 @@ mod tests {
     #[test]
     fn formula_missing_cpu_path_does_not_block_hypervisor_path() {
         // Either path is independently sufficient — hypervisor wins.
-        assert!(compute_virtualization_capability(
-            None,
-            None,
-            Some(true)
-        ));
+        assert!(compute_virtualization_capability(None, None, Some(true)));
     }
 }

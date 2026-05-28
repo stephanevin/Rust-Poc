@@ -40,6 +40,7 @@ windows = { version = "0.62", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_NetManagement",       # NetApiBufferFree
+    "Win32_NetworkManagement_WindowsFilteringPlatform", # FwpmEngineOpen0, FwpmFilterEnum0, FwpmNetEventEnum2, WFP types
     "Win32_NetworkManagement_WindowsFirewall",     # INetFwProducts, INetFwProduct2, NetFwProducts CLSID
     "Win32_Networking_ActiveDirectory",           # DsGetSiteNameW
     "Win32_Networking_WinSock",
