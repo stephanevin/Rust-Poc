@@ -74,7 +74,7 @@ structure of `sdh-fleet-client`:
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 64 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software, system updates, BitLocker, Credential Guard, Event Log, Cloud/AzureAD+MDM). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 82 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software, system updates, BitLocker, Credential Guard, Event Log, Cloud/AzureAD+MDM, EP/AV, firewall, WFP, LAPS, SentinelOne EDR, CyberArk EPM). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
 | **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
@@ -220,7 +220,7 @@ rust-poc-lua/src/
 ├── sandbox.rs          # Strips io/dofile/require/etc. globals
 ├── host.rs             # 64 `host.*` bindings + HostState (Rc<RefCell<..>>)
 ├── wmi.rs              # COMLibrary + per-namespace cache (root\cimv2, root\ccm, FVE, DeviceGuard)
-├── registry.rs         # RegOpenKeyExW + RegQueryValueExW + RegEnumValueW + REG_* decode (incl. binary)
+├── registry.rs         # RegOpenKeyExW + RegQueryValueExW + RegEnumValueW + REG_* decode (incl. binary) + as_string scalar coercion (shared by laps + cyberark)
 ├── net.rs              # GetAdaptersAddresses + IPv4 enumeration
 ├── hostname.rs         # GetComputerNameExW — 3 variants (deviation #6, not in upstream)
 ├── adcomputer.rs       # GetComputerObjectNameW + DsGetSiteNameW + GetUserNameExW — 5 AD attrs (deviation #7, not in upstream)
@@ -239,10 +239,11 @@ rust-poc-lua/src/
 ├── wfp_pipeline.rs     # Port of WfpFilterPipeline.cs — ALE filter, shadowing, dedup, wfp_sublayer_details(), wfp_firewall_view() — deviation #43
 ├── laps.rs             # Windows/Legacy LAPS posture — registry policy cascade + System32 DLL probes; laps_state() — deviation #44, not in upstream
 ├── sentinelone.rs      # SentinelOne EDR — COM IDispatch late-binding (SentinelHelper.GetAgentStatusJSON) + Program Files exe search + Operational #104 CommSdk event — deviation #45, not in upstream
+├── cyberark.rs         # CyberArk EPM (legacy Viewfinity) — vfpd kernel driver status (SC Manager) + HKLM\SOFTWARE\Viewfinity\Agent registry reads — deviation #46, not in upstream
 └── ad.rs               # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 76 `host.*` bindings exposed to Lua
+### The 82 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -322,6 +323,12 @@ rust-poc-lua/src/
 | `host.sentinel_one_agent_status()` **(deviation #45)** | COM **IDispatch late-binding** against the `SentinelHelper` ProgID (`CLSIDFromProgID` + `CoCreateInstance` + `GetIDsOfNames` + `Invoke` → `GetAgentStatusJSON`); deserializes the kebab-case JSON, re-emits snake_case; `nil` (silent) when ProgID unregistered; mirrors `SentinelOne.cs::GetSentinelOneAgentStatusFromJson` | `{active_threats_present, agent_id, agent_install_time, agent_ppl, agent_running, agent_version, detection_mode, enforcing_security, last_seen, management_url, reboot_reasons, self_protection_enabled, site}?` |
 | `host.sentinel_one_paths()` **(deviation #45)** | `%ProgramFiles%[(x86)]\SentinelOne` discovery + bounded recursive search; returns **all** `SentinelCtl.exe` / `sentinelAgent.exe` matches (arrays, not C#'s `LastOrDefault`); mirrors `GetSentinelOneFindFolderPath`/`FindCtlPath`/`FindAgentPath` | `{folder: string?, ctl_paths: [string], agent_paths: [string]}` |
 | `host.sentinel_one_comm_sdk()` **(deviation #45)** | Newest `SentinelOne/Operational` event #104 via `evt::query_events`; exposes `CommSdkMessage` + timestamp; `nil` on any Event Log failure (channel-absent = SentinelOne-not-installed); mirrors `GetSentinelOneCommSdkMessage(+Date)` | `{message: string?, date: string}?` |
+| `host.cyber_ark_epm_driver_status()` **(deviation #46)** | `vfpd` kernel driver state via SC Manager (`OpenServiceW` + `QueryServiceStatus`, reusing `software::service_state_label`); `"None"` when the driver is absent (= C# `ServiceStatus.None`); real SCM failure → `nil` + `cyberark:driver_status`; mirrors `Security.cs::GetCyberArkEpmDriverStatus` | `"Running" \| "Stopped" \| ... \| "None" \| "Unknown"`? |
+| `host.cyber_ark_epm_version()` **(deviation #46)** | `HKLM\SOFTWARE\Viewfinity\Agent` → `Version` (raw string passthrough, no `Version::parse`); mirrors `GetCyberArkEpmVersion` | `string?` |
+| `host.cyber_ark_epm_id()` **(deviation #46)** | Same key → `SetID`; mirrors `GetCyberArkEpmId` | `string?` |
+| `host.cyber_ark_epm_dispatcher_url()` **(deviation #46)** | Same key → `DispatcherURL`; mirrors `GetCyberArkEpmDispatcherUrl` | `string?` |
+| `host.cyber_ark_epm_registered_at()` **(deviation #46)** | Same key → `RegisteredAt` (raw string, never date-parsed, = C#); mirrors `GetCyberArkEpmRegisteredAt` | `string?` |
+| `host.cyber_ark_epm_last_policy_update()` **(deviation #46)** | Same key → `LastPolicyUpdateTime` (`REG_QWORD` FILETIME) → `winver::filetime_to_iso8601` (UTC Zulu); mirrors `GetCyberArkEpmLastPolicyUpdate` | `string?` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -365,7 +372,7 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **nineteen** points where copying upstream byte-for-byte
+There are exactly **eighteen** points where copying upstream byte-for-byte
 would not compile or would not match the surface this PoC needs to
 expose. Each one is documented inline at the touch site so a future
 re-sync is mechanical.
@@ -1014,6 +1021,61 @@ re-sync is mechanical.
     Re-sync impact: `Copy-Item` of `host.rs` MUST preserve the `sentinelone`
     module declaration in `lib.rs` and the `install_sentinelone_bindings` call
     in `install()`.
+
+18. **`rust-poc-lua/src/cyberark.rs` + `install_cyberark_bindings` in
+    `host.rs` — six CyberArk EPM (legacy Viewfinity) bindings (deviation #46).**
+    Not in upstream.  Mirrors the CyberArk EPM region of
+    `ComplianceService/Data/Security/Security.cs`.  Covers the 6 items of the
+    Privileged Account Management (PAM) category in `Win10-Laptop.json` via two
+    Windows mechanisms (no WMI / no COM):
+    - `host.cyber_ark_epm_driver_status()` — the `vfpd` kernel driver status.
+      The C# uses `ServiceController.GetDevices()`; we open the named service
+      directly (`OpenSCManagerW` + `OpenServiceW("vfpd", SERVICE_QUERY_STATUS)`
+      + `QueryServiceStatus`).  `ERROR_SERVICE_DOES_NOT_EXIST` → `"None"`
+      (= C# `ServiceStatus.None`); other SCM failures → `nil` +
+      `cyberark:driver_status`.  Reuses `software::ScHandle` (RAII close) and
+      `software::service_state_label` (both made `pub(crate)`).
+    - `host.cyber_ark_epm_version()` / `_id()` / `_dispatcher_url()` /
+      `_registered_at()` / `_last_policy_update()` — five reads from the single
+      key `HKLM\SOFTWARE\Viewfinity\Agent` (`Version`, `SetID`, `DispatcherURL`,
+      `RegisteredAt`, `LastPolicyUpdateTime`).  All infallible (the `laps.rs`
+      posture): a missing key/value degrades to `nil`, never an error.  The
+      four string reads coerce via the shared `registry::as_string(Value)`
+      helper (see below); `_last_policy_update` reads the `REG_QWORD` directly.
+
+    **Intentional deviations from ComplianceApp:**
+    - **Dates in UTC Zulu.** `LastPolicyUpdateTime` (`REG_QWORD` FILETIME) goes
+      through `winver::filetime_to_iso8601` → `…Z`.  Aligned with the gRPC wire
+      contract (`Timestamp.FromDateTime(dt.ToUniversalTime())`) and the rest of
+      the crate; the bare C# `DateTime.FromFileTime` is local but the same
+      instant travels over the wire as UTC.
+    - **`version` passed through verbatim** (no `Version::parse`; identical
+      output to the wire `Version.ToString()`).
+    - **Targeted query, not enumeration** — `OpenServiceW`+`QueryServiceStatus`
+      on the named driver rather than the C# device-list scan.
+    - **Binding name ≠ output key** for two items: `host.cyber_ark_epm_version()`
+      → `cyber_ark_epm_agent_version`, `host.cyber_ark_epm_last_policy_update()`
+      → `cyber_ark_epm_last_policy_update_date` (the `Agent`/`Date` suffixes in
+      the JSON `Name`s).
+
+    No new Cargo feature: SC Manager needs `Win32_System_Services` +
+    `Win32_Foundation`, both already enabled.
+
+    **Shared scalar coercion — `registry::as_string(Value) -> Option<String>`.**
+    The "`REG_DWORD` `1` and `REG_SZ` `"1"` both become `"1"`" rule (C#
+    `GetValue(...)?.ToString()`) lives once in `registry.rs`, next to the
+    `decode` that produces those `Value`s.  Both the CyberArk reads
+    (`cyberark::reg_string`) and the LAPS reads (`laps::registry_value_string`,
+    deviation #44) delegate to it — the previous `coerce_reg_string` (cyberark)
+    and the inline `match` (laps) were conceptual duplicates and were removed.
+    It takes `Value` **by value** so the `String` case moves instead of cloning.
+
+    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve the `cyberark`
+    module declaration in `lib.rs`, the `install_cyberark_bindings` call in
+    `install()`, and the `pub(crate)` visibility of `software::ScHandle` /
+    `software::service_state_label`.  `Copy-Item` of `registry.rs` from
+    upstream MUST preserve the `as_string` helper (upstream has no equivalent
+    yet, so it is a hand-merge point like `enum_value_names` / `read_binary`).
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is

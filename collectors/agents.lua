@@ -1,7 +1,8 @@
 -- Agents category collector — Cloud (AzureAD / MDM) + Endpoint Protection (EP)
---                              + Firewall (FW) + WFP + LAPS + SentinelOne EDR.
+--                              + Firewall (FW) + WFP + LAPS + SentinelOne EDR
+--                              + CyberArk EPM (PAM).
 --
--- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42 + #43 + #44 + #45):
+-- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42 + #43 + #44 + #45 + #46):
 --
 -- Cloud (deviation #39):
 --   AzureAdJoinedStatus.cs    → azure_ad_joined_status    ("On"/"Off"/"CertificateIsNotValid")
@@ -75,6 +76,19 @@
 -- the parent + agent_found from host.sentinel_one_paths(); the CommSdk pair from
 -- host.sentinel_one_comm_sdk().  sentinel_one_agent_paths is exposed as a
 -- diagnostic enrichment (full sentinelAgent.exe list, beyond the 15 C# items).
+--
+-- CyberArk EPM / PAM (deviation #46):
+--   CyberArkEpmDriverStatus.cs         → cyber_ark_epm_driver_status           ("Running"/"Stopped"/.../"None")
+--   CyberArkEpmAgentVersion.cs         → cyber_ark_epm_agent_version           (string?)
+--   CyberArkEpmDispatcherUrl.cs        → cyber_ark_epm_dispatcher_url          (string?)
+--   CyberArkEpmId.cs                   → cyber_ark_epm_id                      (string?)
+--   CyberArkEpmLastPolicyUpdateDate.cs → cyber_ark_epm_last_policy_update_date (ISO 8601 UTC string?)
+--   CyberArkEpmRegisteredAt.cs         → cyber_ark_epm_registered_at           (string?)
+--
+-- driver_status comes from the vfpd kernel driver via the SC Manager
+-- (host.cyber_ark_epm_driver_status()); the other 5 are registry reads from
+-- HKLM\SOFTWARE\Viewfinity\Agent.  Raw emission: a missing EPM install yields
+-- "None" + nil values, so no RemoveWhen-style derivation is needed.
 --
 -- Run via:
 --   cargo run -- agents.lua
@@ -265,6 +279,16 @@ function collect()
     -- not exposed — same folder as agent_paths, and SentinelCtl.exe presence
     -- is already encoded in sentinel_one_status.
     sentinel_one_agent_paths             = s1_paths and s1_paths.agent_paths or {},
+
+    -- CyberArk EPM / PAM (deviation #46) — 6 stateless bindings. driver_status
+    -- comes from the vfpd kernel driver (SC Manager); the rest are registry
+    -- reads. Raw emission: "None" + nil values when EPM is not installed.
+    cyber_ark_epm_driver_status           = host.cyber_ark_epm_driver_status(),
+    cyber_ark_epm_agent_version           = host.cyber_ark_epm_version(),
+    cyber_ark_epm_dispatcher_url          = host.cyber_ark_epm_dispatcher_url(),
+    cyber_ark_epm_id                      = host.cyber_ark_epm_id(),
+    cyber_ark_epm_last_policy_update_date = host.cyber_ark_epm_last_policy_update(),
+    cyber_ark_epm_registered_at           = host.cyber_ark_epm_registered_at(),
 
     _errors = host.errors(),
   }

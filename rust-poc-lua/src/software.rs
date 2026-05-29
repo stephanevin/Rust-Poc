@@ -361,7 +361,10 @@ pub(super) fn os_software_installed() -> (Vec<Value>, Option<String>, Option<Str
 ///
 /// Calls `CloseServiceHandle` on drop — same pattern as `NetBuf` in
 /// `accounts.rs`. See [Rust Book ch. 15.3](https://doc.rust-lang.org/book/ch15-03-drop.html).
-struct ScHandle(SC_HANDLE);
+///
+/// `pub(crate)` so sibling modules (e.g. `cyberark`, deviation #46) can reuse
+/// the SC Manager teardown instead of duplicating the `unsafe` Drop.
+pub(crate) struct ScHandle(pub(crate) SC_HANDLE);
 
 impl Drop for ScHandle {
     fn drop(&mut self) {
@@ -390,7 +393,10 @@ fn start_mode_label(t: u32) -> &'static str {
 }
 
 /// Maps a Win32 `dwCurrentState` (`SERVICE_STATUS_CURRENT_STATE`) to its string label.
-fn service_state_label(s: u32) -> &'static str {
+///
+/// `pub(crate)` so `cyberark::driver_status` (deviation #46) emits labels
+/// identical to `host.os_services()`.
+pub(crate) fn service_state_label(s: u32) -> &'static str {
     match s {
         1 => "Stopped",
         2 => "StartPending",

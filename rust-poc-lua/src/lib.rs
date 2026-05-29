@@ -152,6 +152,13 @@ mod laps;
 // service in ComplianceApp (EDR/SentinelOne/SentinelOne.cs). Deviation #45.
 #[cfg(windows)]
 mod sentinelone;
+// `cyberark` exposes 6 CyberArk EPM (legacy Viewfinity) bindings: the `vfpd`
+// kernel driver status via the Service Control Manager, plus 5 values from
+// HKLM\SOFTWARE\Viewfinity\Agent (version, last policy update, set id,
+// dispatcher url, registered at). Mirrors the CyberArk EPM region of the
+// Security data service in ComplianceApp (Security.cs). Deviation #46.
+#[cfg(windows)]
+mod cyberark;
 // `wfp_known_guids` holds three lazily-initialised `HashMap<GUID, &str>` maps
 // (layer GUIDs 110+, sublayer GUIDs 17+, condition field GUIDs ~100).
 // Consumed by `wfp_conditions` and `wfp` for human-readable enrichment.

@@ -75,6 +75,21 @@ pub(super) fn read(hive: &str, key: &str, value: &str) -> Result<Option<Value>, 
     Ok(result_val)
 }
 
+/// Coerces a decoded registry [`Value`] into a comparable string: a
+/// `REG_DWORD` `1` and a `REG_SZ` `"1"` both become `"1"`, matching the C#
+/// `GetValue(...)?.ToString()` behaviour. Non-scalar types (`REG_MULTI_SZ`
+/// arrays, …) yield `None`.
+///
+/// Pure (no registry access), so it is unit-testable and shared by the LAPS
+/// (deviation #44) and `CyberArk` EPM (deviation #46) bindings.
+pub(super) fn as_string(value: Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 /// Returns `true` when the registry key exists and can be opened for
 /// reading, `false` when it is absent or cannot be opened for any reason.
 ///
@@ -379,7 +394,21 @@ fn utf16_to_string(buf: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{enum_value_names, key_exists, try_subkey_names};
+    use serde_json::{Value, json};
+
+    use super::{as_string, enum_value_names, key_exists, try_subkey_names};
+
+    /// `as_string`: `REG_SZ` passes through, numbers (`REG_DWORD`/`REG_QWORD`)
+    /// stringify, and non-scalar types collapse to `None`.
+    #[test]
+    fn as_string_coerces_scalars_only() {
+        assert_eq!(as_string(json!("23.4.1.7")), Some("23.4.1.7".to_string()));
+        assert_eq!(as_string(json!(1u32)), Some("1".to_string()));
+        assert_eq!(as_string(json!(42u64)), Some("42".to_string()));
+        assert_eq!(as_string(json!(true)), None);
+        assert_eq!(as_string(json!(["a", "b"])), None);
+        assert_eq!(as_string(Value::Null), None);
+    }
 
     /// `HKLM\SOFTWARE` exists on every Windows install — happy path.
     #[test]

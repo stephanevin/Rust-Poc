@@ -16,8 +16,9 @@ use mlua::{
 };
 
 use super::{
-    accounts, ad, bitlocker, cloud, credentialguard, ep, firewall, gpo, laps, net, regional,
-    registry, sentinelone, software, tls, updates, wfp, wfp_pipeline, winver, wmi::Wmi, wnf, wts,
+    accounts, ad, bitlocker, cloud, credentialguard, cyberark, ep, firewall, gpo, laps, net,
+    regional, registry, sentinelone, software, tls, updates, wfp, wfp_pipeline, winver, wmi::Wmi,
+    wnf, wts,
 };
 
 /// Canonical `host.errors()` key for any failure of
@@ -337,6 +338,7 @@ pub(super) fn install(
     install_wfp_bindings(lua, &host, &state)?;
     install_laps_bindings(lua, &host)?;
     install_sentinelone_bindings(lua, &host, &state)?;
+    install_cyberark_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -1899,6 +1901,80 @@ fn install_sentinelone_bindings(lua: &Lua, host: &Table, state: &HostRef) -> Lua
             })?,
         )?;
     }
+
+    Ok(())
+}
+
+// --- CyberArk EPM (Viewfinity) bindings (deviation #46) ----------------
+
+// Registers one infallible CyberArk registry binding: an Option<String> from
+// HKLM\SOFTWARE\Viewfinity\Agent that degrades to nil on absence. `f` is a bare
+// function pointer (no captured state) — same idiom as bind_hostname. No host
+// error is ever recorded: read failures already collapse to None inside
+// cyberark, and serializing a scalar string/nil cannot fail.
+fn install_cyberark_reg(
+    lua: &Lua,
+    host: &Table,
+    name: &'static str,
+    f: fn() -> Option<String>,
+) -> LuaResult<()> {
+    host.set(
+        name,
+        lua.create_function(move |lua, ()| {
+            let value = f().map_or(serde_json::Value::Null, serde_json::Value::String);
+            Ok(lua.to_value(&value).unwrap_or(Value::Nil))
+        })?,
+    )?;
+    Ok(())
+}
+
+fn install_cyberark_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.cyber_ark_epm_driver_status() — vfpd kernel driver state via the SC
+    // Manager.  "None" when the driver is absent (mirrors ServiceStatus.None);
+    // a real SC Manager failure is recorded under "cyberark:driver_status".
+    {
+        let s = state.clone();
+        host.set(
+            "cyber_ark_epm_driver_status",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match cyberark::driver_status() {
+                    Ok(label) => Ok(lua_to_value_or_nil(
+                        lua,
+                        &mut st,
+                        "cyberark:driver_status",
+                        &serde_json::Value::String(label),
+                    )),
+                    Err(e) => {
+                        st.record_error("cyberark:driver_status", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // Five infallible registry reads from HKLM\SOFTWARE\Viewfinity\Agent.
+    install_cyberark_reg(lua, host, "cyber_ark_epm_version", cyberark::version)?;
+    install_cyberark_reg(lua, host, "cyber_ark_epm_id", cyberark::id)?;
+    install_cyberark_reg(
+        lua,
+        host,
+        "cyber_ark_epm_dispatcher_url",
+        cyberark::dispatcher_url,
+    )?;
+    install_cyberark_reg(
+        lua,
+        host,
+        "cyber_ark_epm_registered_at",
+        cyberark::registered_at,
+    )?;
+    install_cyberark_reg(
+        lua,
+        host,
+        "cyber_ark_epm_last_policy_update",
+        cyberark::last_policy_update,
+    )?;
 
     Ok(())
 }

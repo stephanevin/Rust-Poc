@@ -193,15 +193,11 @@ fn registry_value(key: &str, value: &str) -> Option<Value> {
     registry::read("HKLM", key, value).ok().flatten()
 }
 
-/// Reads a registry value and normalises it to a comparable string, so a
-/// `REG_DWORD` `1` and a `REG_SZ` `"1"` both compare equal to `"1"` —
-/// matching the C# `GetValue(...)?.ToString()` behaviour.
+/// Reads a registry value and normalises it to a comparable string via the
+/// shared [`registry::as_string`] coercion (a `REG_DWORD` `1` and a `REG_SZ`
+/// `"1"` both become `"1"`, matching the C# `GetValue(...)?.ToString()`).
 fn registry_value_string(key: &str, value: &str) -> Option<String> {
-    match registry_value(key, value)? {
-        Value::Number(n) => Some(n.to_string()),
-        Value::String(s) => Some(s),
-        _ => None,
-    }
+    registry::as_string(registry_value(key, value)?)
 }
 
 /// Reads a registry value and parses it as `u32` (DWORD or decimal string).
