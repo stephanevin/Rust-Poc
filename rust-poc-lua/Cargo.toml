@@ -58,6 +58,12 @@ windows = { version = "0.62", features = [
     "Wdk_System_SystemInformation",
     "Wdk_System_SystemServices",
 ] }
+# Event-based XML reader for the SCCM client health report
+# (C:\Windows\CCM\CcmEvalReport.xml) parsed by `sccm.rs`. Deviation #47 —
+# first XML dependency in the workspace; default features only (no serde
+# layer needed, the report schema mixes attributes with element text so it
+# is parsed with the pull reader rather than derive).
+quick-xml = "0.40.1"
 
 [lints]
 workspace = true

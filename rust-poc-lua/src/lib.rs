@@ -37,9 +37,9 @@ mod ad;
 // real Event Log wrapper lives in `evt.rs` (deviation #10); keeping the
 // old name would conflate the two modules.
 #[cfg(windows)]
-mod setup_history;
-#[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod setup_history;
 // `hostname` is the deviation #6 module — added on top of the verbatim
 // port to expose `host.netbios_name()`, `host.host_name()`, and
 // `host.fqdn()` (machine-name variants via GetComputerNameExW).
@@ -159,6 +159,15 @@ mod sentinelone;
 // Security data service in ComplianceApp (Security.cs). Deviation #46.
 #[cfg(windows)]
 mod cyberark;
+// `sccm` exposes 9 SCCM (Configuration Manager) client-health bindings: six
+// WMI reads against root\ccm and children (client version, assigned site via
+// the SMS_Client.GetAssignedSite class method, current management point, MP
+// list last-update date, inventory action status, installed-component status)
+// plus three read-only reads of the ccmeval health report XML
+// (C:\Windows\CCM\CcmEvalReport.xml — never regenerated). Mirrors the SCCM
+// data service in ComplianceApp (SCCM.cs). Deviation #47.
+#[cfg(windows)]
+mod sccm;
 // `wfp_known_guids` holds three lazily-initialised `HashMap<GUID, &str>` maps
 // (layer GUIDs 110+, sublayer GUIDs 17+, condition field GUIDs ~100).
 // Consumed by `wfp_conditions` and `wfp` for human-readable enrichment.

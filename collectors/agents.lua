@@ -1,8 +1,8 @@
 -- Agents category collector — Cloud (AzureAD / MDM) + Endpoint Protection (EP)
 --                              + Firewall (FW) + WFP + LAPS + SentinelOne EDR
---                              + CyberArk EPM (PAM).
+--                              + CyberArk EPM (PAM) + SCCM client health.
 --
--- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42 + #43 + #44 + #45 + #46):
+-- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42 + #43 + #44 + #45 + #46 + #47):
 --
 -- Cloud (deviation #39):
 --   AzureAdJoinedStatus.cs    → azure_ad_joined_status    ("On"/"Off"/"CertificateIsNotValid")
@@ -89,6 +89,23 @@
 -- (host.cyber_ark_epm_driver_status()); the other 5 are registry reads from
 -- HKLM\SOFTWARE\Viewfinity\Agent.  Raw emission: a missing EPM install yields
 -- "None" + nil values, so no RemoveWhen-style derivation is needed.
+--
+-- SCCM client health (deviation #47):
+--   SccmClientStatus.cs                 → sccm_client_status                       (string? — raw <Summary> text; "Client Healthy" label left to UI)
+--   SccmClientStatusDate.cs             → sccm_client_status_date                  (ISO 8601 UTC string? — <Summary EvaluationTime>)
+--   SCCMClientVersion.cs                → sccm_client_version                      (string? — SMS_Client.ClientVersion, raw)
+--   SCCMSiteCode.cs                     → sccm_site_code                           (string? — SMS_Client.GetAssignedSite class method)
+--   SccmCurrentManagementPoint.cs       → sccm_current_management_point            (string? — SMS_Authority.CurrentManagementPoint)
+--   SccmManagementPointLastUpdateDate.cs→ sccm_management_point_last_update_date   (ISO 8601 UTC string? — SMS_MPListEx.LastUpdateTime, DMTF→UTC)
+--   SccmInventoryStatus.cs              → sccm_inventory_status                    (array<{inventory_type, last_major/minor_report_version, last_cycle_started_date, last_report_date}>?)
+--   SccmComponentStatus.cs              → sccm_component_status                    (array<{component, version, status}>?)
+--   SCCMHealthCheck.cs                  → sccm_health_check                        (array<{description, health_check_text}>?)
+--
+-- Six bindings read root\ccm and children via WMI; the three health items
+-- (status, status_date, health_check) share one read-only parse of
+-- C:\Windows\CCM\CcmEvalReport.xml (ccmeval is never launched — deviation #47).
+-- Raw emission: on a non-managed host the WMI reads return nil and the report
+-- is absent, so all nine degrade to nil/[] with no derivation.
 --
 -- Run via:
 --   cargo run -- agents.lua
@@ -289,6 +306,18 @@ function collect()
     cyber_ark_epm_id                      = host.cyber_ark_epm_id(),
     cyber_ark_epm_last_policy_update_date = host.cyber_ark_epm_last_policy_update(),
     cyber_ark_epm_registered_at           = host.cyber_ark_epm_registered_at(),
+
+    -- SCCM client health (deviation #47) — 6 WMI reads (root\ccm) + 3 from the
+    -- shared read-only ccmeval report. Keys mirror the JSON item Names.
+    sccm_client_status                      = host.sccm_client_status(),
+    sccm_client_status_date                 = host.sccm_client_status_date(),
+    sccm_client_version                     = host.sccm_client_version(),
+    sccm_site_code                          = host.sccm_site_code(),
+    sccm_current_management_point           = host.sccm_current_management_point(),
+    sccm_management_point_last_update_date  = host.sccm_mp_last_update_date(),
+    sccm_inventory_status                   = host.sccm_inventory_status(),
+    sccm_component_status                   = host.sccm_component_status(),
+    sccm_health_check                       = host.sccm_health_check(),
 
     _errors = host.errors(),
   }

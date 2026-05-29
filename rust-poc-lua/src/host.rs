@@ -17,8 +17,8 @@ use mlua::{
 
 use super::{
     accounts, ad, bitlocker, cloud, credentialguard, cyberark, ep, firewall, gpo, laps, net,
-    regional, registry, sentinelone, software, tls, updates, wfp, wfp_pipeline, winver, wmi::Wmi,
-    wnf, wts,
+    regional, registry, sccm, sentinelone, software, tls, updates, wfp, wfp_pipeline, winver,
+    wmi::Wmi, wnf, wts,
 };
 
 /// Canonical `host.errors()` key for any failure of
@@ -38,6 +38,13 @@ const ERR_KEY_AU_SERVICE: &str = "updates:au_service";
 /// [`wfp::enumerate_wfp_state`].  All three WFP bindings surface the same
 /// diagnostic to avoid duplicating the expensive init error.
 const ERR_KEY_WFP_CACHE_INIT: &str = "wfp:cache_init";
+
+/// Canonical `host.errors()` key for any failure of
+/// [`sccm::read_health_report`].  The three ccmeval-backed bindings
+/// (`sccm_client_status`, `sccm_client_status_date`, `sccm_health_check`)
+/// share one cache, so a read/parse failure surfaces under this single key
+/// regardless of which binding triggered the init.
+const ERR_KEY_SCCM_HEALTH: &str = "sccm:health_report";
 
 /// Tri-state cache for the shared WUA offline payload.
 ///
@@ -100,6 +107,20 @@ pub(super) enum WfpCacheState {
     Failed,
 }
 
+/// Tri-state cache for the ccmeval client-health report.
+///
+/// Mirrors [`UpdatesCacheState`]: the report file is read and parsed at most
+/// once per run, shared by the three health bindings. The inner
+/// `Option<SccmHealthReport>` of [`Ready`](Self::Ready) distinguishes "file
+/// absent" (`Ready(None)` — machine not managed / never evaluated, not an
+/// error) from "parsed" (`Ready(Some(..))`). [`Failed`](Self::Failed)
+/// memoises a genuine read failure so it is not retried.
+pub(super) enum SccmHealthState {
+    NotInit,
+    Ready(Option<sccm::SccmHealthReport>),
+    Failed,
+}
+
 /// Per-run mutable state passed into binding closures. Lua is !Send, so
 /// this lives on the blocking thread that owns the Lua VM.
 pub(super) struct HostState {
@@ -133,6 +154,11 @@ pub(super) struct HostState {
     /// failures are memoised so the expensive enumeration is never retried
     /// within the same run.
     pub wfp_cache: WfpCacheState,
+    /// Cache of the ccmeval client-health report, populated lazily on the
+    /// first SCCM health binding call.  The report XML is read and parsed at
+    /// most once per run; an absent file is the valid `Ready(None)` outcome,
+    /// a read failure is memoised in [`SccmHealthState::Failed`].
+    pub sccm_health: SccmHealthState,
     pub errors: HashMap<String, String>,
 }
 
@@ -146,6 +172,7 @@ impl HostState {
             updates_cache: UpdatesCacheState::NotInit,
             au_service: AuServiceState::NotInit,
             wfp_cache: WfpCacheState::NotInit,
+            sccm_health: SccmHealthState::NotInit,
             errors: HashMap::new(),
         }
     }
@@ -282,6 +309,31 @@ impl HostState {
             WfpCacheState::NotInit | WfpCacheState::Failed => None,
         }
     }
+
+    /// Lazy-init accessor for the ccmeval client-health report.
+    ///
+    /// The report XML is read and parsed at most once per run, shared by the
+    /// three SCCM health bindings.  An absent report file is the valid
+    /// `Ready(None)` outcome (machine not managed); a genuine read failure is
+    /// memoised in [`SccmHealthState::Failed`] and recorded once under
+    /// [`ERR_KEY_SCCM_HEALTH`].  Never launches `ccmeval.exe` (deviation #47).
+    fn ensure_sccm_health(&mut self) -> Option<&sccm::SccmHealthReport> {
+        if matches!(self.sccm_health, SccmHealthState::NotInit) {
+            match sccm::read_health_report() {
+                Ok(report) => self.sccm_health = SccmHealthState::Ready(report),
+                Err(e) => {
+                    self.sccm_health = SccmHealthState::Failed;
+                    if !self.errors.contains_key(ERR_KEY_SCCM_HEALTH) {
+                        self.errors.insert(ERR_KEY_SCCM_HEALTH.to_string(), e);
+                    }
+                }
+            }
+        }
+        match &self.sccm_health {
+            SccmHealthState::Ready(report) => report.as_ref(),
+            SccmHealthState::NotInit | SccmHealthState::Failed => None,
+        }
+    }
 }
 
 /// Shared handle to `HostState`. We wrap in `Rc<RefCell<..>>` so every Lua
@@ -339,6 +391,7 @@ pub(super) fn install(
     install_laps_bindings(lua, &host)?;
     install_sentinelone_bindings(lua, &host, &state)?;
     install_cyberark_bindings(lua, &host, &state)?;
+    install_sccm_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -1975,6 +2028,111 @@ fn install_cyberark_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaRes
         "cyber_ark_epm_last_policy_update",
         cyberark::last_policy_update,
     )?;
+
+    Ok(())
+}
+
+// --- SCCM client health bindings (deviation #47) -----------------------
+
+// Installs one ccmeval-backed `host.*` binding that maps the shared
+// SccmHealthReport cache to an optional JSON value.  `f` extracts an owned
+// value from the report (cloned so the &report borrow is released before the
+// &mut st reborrow in lua_to_value_or_nil).  A missing report (file absent /
+// read failure already recorded under ERR_KEY_SCCM_HEALTH) yields nil.
+fn install_sccm_health(
+    lua: &Lua,
+    host: &Table,
+    state: &HostRef,
+    name: &'static str,
+    f: fn(&sccm::SccmHealthReport) -> Option<serde_json::Value>,
+) -> LuaResult<()> {
+    let s = state.clone();
+    host.set(
+        name,
+        lua.create_function(move |lua, ()| {
+            let mut st = s.borrow_mut();
+            match st.ensure_sccm_health().and_then(f) {
+                Some(v) => Ok(lua_to_value_or_nil(lua, &mut st, ERR_KEY_SCCM_HEALTH, &v)),
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+    Ok(())
+}
+
+fn install_sccm_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // Six WMI reads (root\ccm and children) — reuse the generic helpers.
+    bind_wmi_json_option(
+        lua,
+        host,
+        state,
+        "sccm_client_version",
+        "sccm:client_version",
+        sccm::client_version,
+    )?;
+    bind_wmi_json_option(
+        lua,
+        host,
+        state,
+        "sccm_site_code",
+        "sccm:site_code",
+        sccm::site_code,
+    )?;
+    bind_wmi_json_option(
+        lua,
+        host,
+        state,
+        "sccm_current_management_point",
+        "sccm:current_management_point",
+        sccm::current_management_point,
+    )?;
+    bind_wmi_json_option(
+        lua,
+        host,
+        state,
+        "sccm_mp_last_update_date",
+        "sccm:mp_last_update",
+        sccm::mp_last_update_date,
+    )?;
+    bind_wmi_json_array(
+        lua,
+        host,
+        state,
+        "sccm_inventory_status",
+        "sccm:inventory_status",
+        sccm::inventory_status,
+    )?;
+    bind_wmi_json_array(
+        lua,
+        host,
+        state,
+        "sccm_component_status",
+        "sccm:component_status",
+        sccm::component_status,
+    )?;
+
+    // Three read-only ccmeval health bindings sharing the SccmHealthReport
+    // cache.  Raw emission: the "Passed" -> "Client Healthy" label is left to
+    // the UI (deviation #47.5).
+    install_sccm_health(lua, host, state, "sccm_client_status", |r| {
+        r.summary_text.clone().map(serde_json::Value::String)
+    })?;
+    install_sccm_health(lua, host, state, "sccm_client_status_date", |r| {
+        r.evaluation_time.clone().map(serde_json::Value::String)
+    })?;
+    install_sccm_health(lua, host, state, "sccm_health_check", |r| {
+        Some(serde_json::Value::Array(
+            r.entries
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "description": e.description,
+                        "health_check_text": e.health_check_text,
+                    })
+                })
+                .collect(),
+        ))
+    })?;
 
     Ok(())
 }

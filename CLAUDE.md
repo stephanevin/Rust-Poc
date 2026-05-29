@@ -74,7 +74,7 @@ structure of `sdh-fleet-client`:
 | Crate | Role | Mirror in sdh-fleet-client |
 |---|---|---|
 | **`rust-poc-contracts`** (`contracts/`) | Placeholder crate for cross-workspace wire types. Currently empty after the Hello World types were retired — kept to preserve the "types live in `contracts/`" invariant for future additions. | `sdh-fleet-client/contracts/` |
-| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 82 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software, system updates, BitLocker, Credential Guard, Event Log, Cloud/AzureAD+MDM, EP/AV, firewall, WFP, LAPS, SentinelOne EDR, CyberArk EPM). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
+| **`rust-poc-lua`** (`rust-poc-lua/`) | In-process Lua 5.4 collector runtime + 91 `host.*` bindings (WMI, registry, networking, ADSI, hostname variants, WTS, NT kernel, WNF, GPO, TLS, regional, accounts, software, system updates, BitLocker, Credential Guard, Event Log, Cloud/AzureAD+MDM, EP/AV, firewall, WFP, LAPS, SentinelOne EDR, CyberArk EPM, SCCM client health). Windows-only real impl + cross-target stub. | `sdh-fleet-client/lua/` (verbatim port, see [Lua collector runtime](#lua-collector-runtime)) |
 | **`rust-poc`** (root + `src/main.rs`) | Composer — installs the tracing subscriber, validates the CLI script path, drives `rust-poc-lua::InternalRuntime::run`. Ships the `collect-config` binary. | `sdh-fleet-client/src/main.rs` + `sdh-fleet-client/src/logging.rs` |
 
 ### Architectural rules
@@ -240,10 +240,11 @@ rust-poc-lua/src/
 ├── laps.rs             # Windows/Legacy LAPS posture — registry policy cascade + System32 DLL probes; laps_state() — deviation #44, not in upstream
 ├── sentinelone.rs      # SentinelOne EDR — COM IDispatch late-binding (SentinelHelper.GetAgentStatusJSON) + Program Files exe search + Operational #104 CommSdk event — deviation #45, not in upstream
 ├── cyberark.rs         # CyberArk EPM (legacy Viewfinity) — vfpd kernel driver status (SC Manager) + HKLM\SOFTWARE\Viewfinity\Agent registry reads — deviation #46, not in upstream
+├── sccm.rs             # SCCM client health — 6 WMI reads (root\ccm + children, incl. SMS_Client.GetAssignedSite class method) + read-only ccmeval CcmEvalReport.xml parse (quick-xml) — deviation #47, not in upstream
 └── ad.rs               # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 82 `host.*` bindings exposed to Lua
+### The 91 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -329,6 +330,15 @@ rust-poc-lua/src/
 | `host.cyber_ark_epm_dispatcher_url()` **(deviation #46)** | Same key → `DispatcherURL`; mirrors `GetCyberArkEpmDispatcherUrl` | `string?` |
 | `host.cyber_ark_epm_registered_at()` **(deviation #46)** | Same key → `RegisteredAt` (raw string, never date-parsed, = C#); mirrors `GetCyberArkEpmRegisteredAt` | `string?` |
 | `host.cyber_ark_epm_last_policy_update()` **(deviation #46)** | Same key → `LastPolicyUpdateTime` (`REG_QWORD` FILETIME) → `winver::filetime_to_iso8601` (UTC Zulu); mirrors `GetCyberArkEpmLastPolicyUpdate` | `string?` |
+| `host.sccm_client_version()` **(deviation #47)** | WMI `root\ccm` `SMS_Client.ClientVersion` (raw passthrough, no `Version::parse`); mirrors `SCCMClientVersion` | `string?` |
+| `host.sccm_site_code()` **(deviation #47)** | WMI class method `SMS_Client.GetAssignedSite` (`exec_class_method`) → `sSiteCode`; no registry fallback; mirrors `SCCMSiteCode` | `string?` |
+| `host.sccm_current_management_point()` **(deviation #47)** | WMI `root\ccm` `SMS_Authority.CurrentManagementPoint`; mirrors `SccmCurrentManagementPoint` | `string?` |
+| `host.sccm_mp_last_update_date()` **(deviation #47)** | WMI `root\ccm\LocationServices` `SMS_MPListEx.LastUpdateTime` (DMTF) → `dmtf_to_iso8601` (UTC Zulu); mirrors `SccmManagementPointLastUpdateDate` | `string?` |
+| `host.sccm_inventory_status()` **(deviation #47)** | WMI `root\ccm\InvAgt` `InventoryActionStatus`: type (GUID→name), major/minor report versions, two cycle dates (DMTF→UTC); mirrors `SccmInventoryStatus` | `array<{inventory_type, last_major_report_version, last_minor_report_version, last_cycle_started_date, last_report_date}>?` |
+| `host.sccm_component_status()` **(deviation #47)** | WMI `root\ccm` `CCM_InstalledComponent` joined with `root\ccm\Policy\Machine` `CCM_ComponentClientConfig.Enabled`; status `Enabled`/`Disabled`/`Installed`, sorted by component; mirrors `SccmComponentStatus` | `array<{component, version, status}>?` |
+| `host.sccm_client_status()` **(deviation #47)** | ccmeval `CcmEvalReport.xml` `<Summary>` text (read-only, shared cache); raw value, no "Client Healthy" label; mirrors `SccmClientStatus` | `string?` |
+| `host.sccm_client_status_date()` **(deviation #47)** | ccmeval `<Summary EvaluationTime>` (ISO 8601 Zulu, shared cache); mirrors `SccmClientStatusDate` | `string?` |
+| `host.sccm_health_check()` **(deviation #47)** | ccmeval `<HealthCheck>` rows (shared cache); mirrors `SCCMHealthCheck` | `array<{description, health_check_text}>?` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -372,7 +382,7 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **eighteen** points where copying upstream byte-for-byte
+There are exactly **nineteen** points where copying upstream byte-for-byte
 would not compile or would not match the surface this PoC needs to
 expose. Each one is documented inline at the touch site so a future
 re-sync is mechanical.
@@ -1077,6 +1087,62 @@ re-sync is mechanical.
     upstream MUST preserve the `as_string` helper (upstream has no equivalent
     yet, so it is a hand-merge point like `enum_value_names` / `read_binary`).
 
+19. **`rust-poc-lua/src/sccm.rs` + `install_sccm_bindings` in `host.rs` —
+    nine SCCM client-health bindings (deviation #47).**
+    Not in upstream.  Mirrors `ComplianceService/Data/SCCM/SCCM.cs`.  Covers
+    the 9 items of the SCCM category in `Win10-Laptop.json` via two mechanisms
+    (no process launch):
+    - **Six WMI reads** against the ConfigMgr client namespaces (`root\ccm`
+      and children).  Four return `Option<Value>` and reuse the generic
+      `bind_wmi_json_option`; two return `Vec<Value>` and reuse
+      `bind_wmi_json_array`.  `sccm_site_code` is the only one that is not a
+      property read: it invokes the **static class method**
+      `SMS_Client.GetAssignedSite` via `WMIConnection::exec_class_method`
+      (the same `exec` family `bitlocker.rs` uses for instance methods) and
+      reads the `sSiteCode` out-param.  `sccm_component_status` joins
+      `CCM_InstalledComponent` with `CCM_ComponentClientConfig` Rust-side
+      (the C# `ComponentName IS NOT NULL AND Enabled IS NOT NULL` predicate is
+      applied over a cached unfiltered query — no `wmi.rs` extension).
+    - **Three read-only ccmeval reads** of `C:\Windows\CCM\CcmEvalReport.xml`,
+      sharing one parse via the `HostState::sccm_health` cache
+      (`SccmHealthState`, mirror of `UpdatesCacheState`).  `ensure_sccm_health`
+      reads + parses once; `Ready(None)` = file absent (machine not managed,
+      not an error), `Failed` = a genuine read failure recorded once under
+      `ERR_KEY_SCCM_HEALTH = "sccm:health_report"`.
+
+    **Intentional deviations from ComplianceApp:**
+    - **Read-only ccmeval (major deviation).** `SCCM.cs` launches
+      `ccmeval.exe` and waits up to 5 minutes when the report is missing or
+      stale.  A collector must not spawn processes, so `read_health_report`
+      only parses an existing report; absent → `nil`/`[]`, never regenerated.
+    - **`client_version` passed through verbatim** (no `Version::parse`),
+      same posture as `cyberark::version`.
+    - **`site_code` via the class method only** — no registry fallback (the
+      method is the faithful source; minimal surface).
+    - **`"Client Healthy"` label left to the UI** — `sccm_client_status`
+      emits the raw `<Summary>` text (posture of #45/#46).
+    - **CIM datetimes → UTC Zulu.** `SMS_MPListEx.LastUpdateTime` and the
+      `InventoryActionStatus` dates are WMI DMTF strings
+      (`yyyyMMddHHmmss.ffffff±UUU`); `sccm::dmtf_to_iso8601` converts them to
+      `…Z` by computing a Unix-second count (Howard Hinnant `days_from_civil`,
+      the inverse of `winver.rs`) and reusing `winver::filetime_to_iso8601`
+      for the calendar formatting.  The XML `EvaluationTime` is already ISO
+      8601 Zulu and is passed through.
+    - **Component status derived label + sort**; `Installed` when no config
+      row exists for a component.
+
+    **New Cargo dependency: `quick-xml` (Windows-only).**  First XML dep in
+    the workspace, under `[target.'cfg(windows)'.dependencies]`.  Default
+    features only — the report mixes attributes with element text, so it is
+    parsed with the pull reader (`Reader::from_str` + `read_event`), not the
+    serde derive layer.
+
+    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve the `sccm` module
+    declaration in `lib.rs`, the `install_sccm_bindings` call in `install()`,
+    the `HostState::sccm_health` field + `SccmHealthState` enum +
+    `ensure_sccm_health` accessor, and the `quick-xml` dependency in
+    `rust-poc-lua/Cargo.toml`.
+
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is
 byte-identical to upstream.
@@ -1123,6 +1189,21 @@ studying when the crate's source rolls past:
 - **COM/WMI** via the `wmi` crate — `COMLibrary::new` initialises COM,
   `WMIConnection::raw_query` runs typed-via-serde queries against
   `root\cimv2`.
+- **WMI class methods** — `WMIConnection::exec_class_method::<Class, Out>`
+  in `sccm.rs` (deviation #47) invokes a *static* provider method
+  (`SMS_Client.GetAssignedSite`) rather than querying instances. The `Class`
+  generic is a zero-sized `#[derive(Deserialize)]` marker whose type name
+  resolves the method signature; `()` is passed for a no-input method; the
+  `Out` struct deserializes the out-params (`#[serde(rename = "sSiteCode")]`).
+  Sibling of `exec_instance_method` used in `bitlocker.rs`. (Reference: WMI
+  method invocation.)
+- **Pull-based XML parsing** — `quick-xml` (deviation #47) reads the ccmeval
+  health report event-by-event (`Reader::from_str` → `read_event` → `match`
+  on `Event::Start/Empty/Text/End`). Chosen over the serde derive layer
+  because the report mixes element text with attributes on the same node
+  (`<Summary EvaluationTime="…">Passed</Summary>`), which maps awkwardly to a
+  `#[derive(Deserialize)]` struct. The borrowing `Reader::from_str` variant
+  needs no event buffer. (Reference: `quick-xml` pull reader.)
 - **COM IDispatch late-binding** — `sentinelone.rs` (deviation #45) calls a
   COM object that ships no type library, so it cannot be early-bound against a
   typed `windows-rs` interface like every other COM consumer in the crate.
