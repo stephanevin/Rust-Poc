@@ -1,7 +1,7 @@
 -- Agents category collector — Cloud (AzureAD / MDM) + Endpoint Protection (EP)
---                              + Firewall (FW) + WFP.
+--                              + Firewall (FW) + WFP + LAPS.
 --
--- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42 + #43):
+-- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42 + #43 + #44):
 --
 -- Cloud (deviation #39):
 --   AzureAdJoinedStatus.cs    → azure_ad_joined_status    ("On"/"Off"/"CertificateIsNotValid")
@@ -39,6 +39,19 @@
 --   WfpSubLayerDetails.cs → wfp_sublayer_details (sublayer groups, all filters)
 --   WfpFirewallView.cs    → wfp_firewall_view    (ALE-filtered, shadowed, deduped)
 --   WfpNetEvents.cs       → wfp_net_events       (latest 1000 net events, timestamp DESC)
+--
+-- LAPS (deviation #44):
+--   AutoLapsMode.cs                → auto_laps_mode             ("Not Installed"/"Legacy"/"Windows")
+--   WindowsLapsBackupDirectory.cs  → windows_laps_backup_dir    ("Disabled"/"MicrosoftEntra"/"ActiveDirectory"/"ActiveDirectoryLegacy")
+--   WindowsLapsPolicy.cs           → windows_laps_policy        ("None"/"CSP"/"GroupPolicy"/"LocalConfiguration"/"LegacyMicrosoftLaps")
+--   WindowsLapsDllLocation.cs      → windows_laps_dll_location  ("Found"/"NotFound")
+--   LegacyLapsGpExtension.cs       → legacy_laps_gp_extension   (bool)
+--   LocalAdminPasswordDate.cs      → local_admin_password_date  (ISO 8601 UTC string?; built-in Administrator SID *-500)
+--   WindowsLapsMaxPwdAge.cs        → windows_laps_max_pwd_age   (int? days)
+--
+-- All six host.laps_state() fields come from one stateless call (registry +
+-- System32 DLL probes); local_admin_password_date is derived from
+-- host.local_user_accounts() (deviation #20).
 --
 -- Run via:
 --   cargo run -- agents.lua
@@ -111,6 +124,24 @@ function collect()
     return #names == 0 and "Windows Defender Firewall" or table.concat(names, "\n")
   end
 
+  -- LAPS (deviation #44) -----------------------------------------------------
+  -- host.laps_state() returns the whole LAPS posture in one stateless call.
+  -- local_admin_password_date is derived from host.local_user_accounts()
+  -- (deviation #20): the built-in Administrator is the account whose SID ends
+  -- in "-500" — same selector as Security.cs (PrincipalContext.Machine +
+  -- Sid.Value.EndsWith("-500")). last_password_set is already ISO 8601 UTC.
+  local laps = host.laps_state()
+  local local_admin_password_date = nil
+  local accounts = host.local_user_accounts()
+  if accounts then
+    for _, acc in ipairs(accounts) do
+      if acc.sid and acc.sid:sub(-4) == "-500" then
+        local_admin_password_date = acc.last_password_set
+        break
+      end
+    end
+  end
+
   return {
     -- Cloud — AzureAD join status + MDM/Intune enrollment.
     azure_ad_joined_status     = host.azure_ad_joined_status(),
@@ -161,6 +192,16 @@ function collect()
     wfp_sublayer_details = host.wfp_sublayer_details(),
     wfp_firewall_view    = host.wfp_firewall_view(),
     wfp_net_events       = host.wfp_net_events(),
+
+    -- LAPS (deviation #44) — one stateless host.laps_state() call + the
+    -- built-in Administrator password date from host.local_user_accounts().
+    auto_laps_mode             = laps and laps.auto_laps_mode,
+    windows_laps_backup_dir    = laps and laps.laps_backup_directory,
+    windows_laps_policy        = laps and laps.laps_policy,
+    windows_laps_dll_location  = laps and laps.windows_laps_dll_state,
+    legacy_laps_gp_extension   = laps and laps.legacy_gp_extension_present,
+    local_admin_password_date  = local_admin_password_date,
+    windows_laps_max_pwd_age   = laps and laps.max_pwd_age_days,
 
     _errors = host.errors(),
   }

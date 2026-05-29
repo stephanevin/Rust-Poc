@@ -75,6 +75,34 @@ pub(super) fn read(hive: &str, key: &str, value: &str) -> Result<Option<Value>, 
     Ok(result_val)
 }
 
+/// Returns `true` when the registry key exists and can be opened for
+/// reading, `false` when it is absent or cannot be opened for any reason.
+///
+/// Only the *presence* of the key matters — no value is read.  Mirrors the
+/// C# existence probe `_registry.GetKey(path) is not null` used by
+/// `Security.cs::GetLegacyLapsGpExtensionPresent` (deviation #44).
+pub(super) fn key_exists(hive: &str, key: &str) -> bool {
+    let root: HKEY = match hive {
+        "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
+        "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
+        "HKU" | "HKEY_USERS" => HKEY_USERS,
+        _ => return false,
+    };
+
+    let mut hkey = HKEY::default();
+    let key_w: HSTRING = key.into();
+    // SAFETY: HSTRING outlives the call; KEY_READ is non-destructive.
+    let r = unsafe { RegOpenKeyExW(root, PCWSTR(key_w.as_ptr()), None, KEY_READ, &mut hkey) };
+    if r.is_ok() {
+        // SAFETY: hkey was opened successfully; RegCloseKey never fails for
+        // a handle returned by RegOpenKeyExW.
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+    }
+    r.is_ok()
+}
+
 /// Returns the names of all direct subkeys of `key` in `hive`.
 /// Returns an empty `Vec` when the key is absent, has no subkeys, or
 /// could not be opened for any other reason — failures are absorbed
@@ -351,7 +379,28 @@ fn utf16_to_string(buf: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{enum_value_names, try_subkey_names};
+    use super::{enum_value_names, key_exists, try_subkey_names};
+
+    /// `HKLM\SOFTWARE` exists on every Windows install — happy path.
+    #[test]
+    fn key_exists_true_for_well_known_key() {
+        assert!(key_exists("HKLM", "SOFTWARE"));
+    }
+
+    /// A crafted-absent key must be reported as not existing.
+    #[test]
+    fn key_exists_false_for_absent_key() {
+        assert!(!key_exists(
+            "HKLM",
+            r"SOFTWARE\This-Key-Does-Not-Exist-rust-poc-laps-54321"
+        ));
+    }
+
+    /// An unsupported hive collapses to `false` (no panic, no error).
+    #[test]
+    fn key_exists_false_for_unsupported_hive() {
+        assert!(!key_exists("BOGUS_HIVE", "anything"));
+    }
 
     /// `HKLM\SOFTWARE` exists on every Windows install and has many
     /// subkeys — happy path.

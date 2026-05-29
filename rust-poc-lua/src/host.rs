@@ -16,8 +16,8 @@ use mlua::{
 };
 
 use super::{
-    accounts, ad, bitlocker, cloud, credentialguard, ep, firewall, gpo, net, regional, registry,
-    software, tls, updates, wfp, wfp_pipeline, winver, wmi::Wmi, wnf, wts,
+    accounts, ad, bitlocker, cloud, credentialguard, ep, firewall, gpo, laps, net, regional,
+    registry, software, tls, updates, wfp, wfp_pipeline, winver, wmi::Wmi, wnf, wts,
 };
 
 /// Canonical `host.errors()` key for any failure of
@@ -335,6 +335,7 @@ pub(super) fn install(
     install_ep_bindings(lua, &host, &state)?;
     install_firewall_bindings(lua, &host, &state)?;
     install_wfp_bindings(lua, &host, &state)?;
+    install_laps_bindings(lua, &host)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -1798,6 +1799,39 @@ fn install_wfp_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<(
             })?,
         )?;
     }
+
+    Ok(())
+}
+
+// --- LAPS bindings (deviation #44) -----------------------------------
+
+fn install_laps_bindings(lua: &Lua, host: &Table) -> LuaResult<()> {
+    // host.laps_state() — Windows / Legacy LAPS configuration snapshot.
+    //
+    // Stateless: each field is an independent registry read or File::exists
+    // probe (all cheap, side-effect free), so there is no per-run cache like
+    // WFP's WfpState.  Mirrors the LAPS transformers in ComplianceApp
+    // (Security.cs + DataTransformers/LAPS/*.cs):
+    //   - auto_laps_mode              ← GetLegacyLapsGpExtensionPresent + GetWindowsLapsDllExists
+    //   - windows_laps_dll_state      ← GetWindowsLapsDllExists
+    //   - laps_policy                 ← GetLapsPolicy (4-key presence cascade)
+    //   - laps_backup_directory       ← GetLapsBackupDirectory
+    //   - legacy_gp_extension_present ← GetLegacyLapsGpExtensionPresent
+    //   - max_pwd_age_days            ← GetLapsMaxPasswordAge
+    //
+    // Deviation #44: auto_laps_mode emits "Not Installed" (not the C#
+    // "Unknown") when no LAPS implementation is detected, so the
+    // Win10-Laptop.json `AutoLapsMode != "Not Installed"` parent test
+    // behaves as intended.  laps_state() is infallible — every probe
+    // degrades to a safe default, so nothing is ever recorded in
+    // host.errors().
+    host.set(
+        "laps_state",
+        lua.create_function(|lua, ()| {
+            lua.to_value(&laps::laps_state())
+                .map_err(|e| mlua::Error::runtime(format!("laps_state serialize: {e}")))
+        })?,
+    )?;
 
     Ok(())
 }

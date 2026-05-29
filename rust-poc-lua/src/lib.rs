@@ -139,6 +139,12 @@ mod ep;
 // (INetFwProducts / INetFwProduct2 → RuleCategories). Deviation #42.
 #[cfg(windows)]
 mod firewall;
+// `laps` exposes host.laps_state(): the Windows/Legacy LAPS posture (policy
+// channel, backup directory, DLL presence, GP extension, max password age)
+// via registry reads + System32 DLL probes. Mirrors the LAPS transformers in
+// ComplianceApp (Security.cs). Deviation #44.
+#[cfg(windows)]
+mod laps;
 // `wfp_known_guids` holds three lazily-initialised `HashMap<GUID, &str>` maps
 // (layer GUIDs 110+, sublayer GUIDs 17+, condition field GUIDs ~100).
 // Consumed by `wfp_conditions` and `wfp` for human-readable enrichment.

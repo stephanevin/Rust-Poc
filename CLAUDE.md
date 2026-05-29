@@ -237,10 +237,11 @@ rust-poc-lua/src/
 ├── wfp_conditions.rs   # FWP_CONDITION_VALUE0 parser → WfpCondition; conditions_json() + format_compact() — deviation #43
 ├── wfp.rs              # WfpEngine RAII, WfpMemoryGuard RAII, enumerate_wfp_state() (6 Win32 enums), wfp_net_events() — deviation #43
 ├── wfp_pipeline.rs     # Port of WfpFilterPipeline.cs — ALE filter, shadowing, dedup, wfp_sublayer_details(), wfp_firewall_view() — deviation #43
+├── laps.rs             # Windows/Legacy LAPS posture — registry policy cascade + System32 DLL probes; laps_state() — deviation #44, not in upstream
 └── ad.rs               # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 72 `host.*` bindings exposed to Lua
+### The 73 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -316,6 +317,7 @@ rust-poc-lua/src/
 | `host.wfp_sublayer_details()` **(deviation #43)** | All WFP filters grouped by sublayer, sorted `sublayer_weight DESC` per group then `layer_name ASC / effective_weight DESC`; enriched with provider/layer/sublayer names; shares `WfpState` cache with #43 siblings; mirrors `WfpSubLayerDetails.cs` | `array<{sublayer_key, sublayer_name, total_filters, weight, wfp_filter_details[]}>` — fields named so that `sublayer_*` sorts before the large `wfp_filter_details` array under serde_json BTreeMap ordering |
 | `host.wfp_firewall_view()` **(deviation #43)** | ALE-filtered + shadowed + deduplicated firewall view; three pipeline steps from `WfpFilterPipeline.cs`; compact Unicode-symbol condition strings; sorted by direction / sublayer weight / effective weight; mirrors `WfpFirewallView.cs` | `array<{order_id, direction, name, provider_name, layer_name_normalized, sublayer_name, action, has_clear_action_right, conditions, conditions_json, variant_details[]}>` |
 | `host.wfp_net_events()` **(deviation #43)** | Up to 1 000 recent WFP net events via `FwpmNetEventEnum2` using an **ephemeral** engine; enriched from the shared `WfpState` cache (`filter_index`, `layer_id_index`); sorted timestamp DESC; `layerId < 200` heuristic omitted (intentional deviation); mirrors `WfpNetEvents.cs` | `array<{timestamp, direction, event_type, protocol_name, local_address, local_port, remote_address, remote_port, app_id, filter_id, filter_name, sublayer_name}>` |
+| `host.laps_state()` **(deviation #44)** | Windows/Legacy LAPS posture in one stateless call: legacy AdmPwd CSE key existence + System32 `laps.dll`/`lapscsp.dll` probes + 4-key policy cascade (`BackupDirectory`/`AdmPwdEnabled` presence) + `PasswordAgeDays`; mirrors `Security.cs` LAPS transformers; `auto_laps_mode` emits `"Not Installed"` (not C#'s `"Unknown"`) when no LAPS detected | `{auto_laps_mode, windows_laps_dll_state, laps_policy, laps_backup_directory, legacy_gp_extension_present, max_pwd_age_days}` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -359,7 +361,7 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **seventeen** points where copying upstream byte-for-byte
+There are exactly **eighteen** points where copying upstream byte-for-byte
 would not compile or would not match the surface this PoC needs to
 expose. Each one is documented inline at the touch site so a future
 re-sync is mechanical.
@@ -917,6 +919,47 @@ re-sync is mechanical.
     Re-sync impact: `Copy-Item` of `host.rs` MUST preserve all four `wfp*` module
     declarations in `lib.rs`, the `install_wfp_bindings` call in `install()`, and
     the `WfpCacheState` + `wfp_cache` additions to `HostState`.
+
+16. **`rust-poc-lua/src/laps.rs` + `install_laps_bindings` in `host.rs` —
+    one LAPS posture binding.**
+    Not in upstream.  Mirrors the LAPS transformers in ComplianceApp
+    (`Security.cs` + `DataTransformers/LAPS/*.cs`).  Exposes a single
+    `host.laps_state()` that returns the whole Windows/Legacy LAPS posture in
+    one stateless call (no per-run cache — every field is a cheap registry
+    read or `Path::exists` probe):
+    - `auto_laps_mode` — `"Legacy"` (legacy AdmPwd CSE key present) /
+      `"Windows"` (both `System32\laps.dll` + `lapscsp.dll` present) /
+      `"Not Installed"` (neither).  Legacy wins over Windows, same ordering
+      as `AutoLapsMode.cs`.
+    - `windows_laps_dll_state` — `"Found"` (both DLLs) / `"NotFound"`.
+    - `laps_policy` — 4-key presence cascade (CSP → GPO → local → legacy
+      AdmPwd); first match wins; mirrors `GetLapsPolicy`.
+    - `laps_backup_directory` — `BackupDirectory` (`"1"`→`MicrosoftEntra`,
+      `"2"`→`ActiveDirectory`) or legacy `AdmPwdEnabled` (`"1"`→
+      `ActiveDirectoryLegacy`); else `Disabled`.
+    - `legacy_gp_extension_present` — bool; existence of the AdmPwd CSE GP
+      extension key `{D76B9641-3288-4f75-942D-087DE603E3EA}`.
+    - `max_pwd_age_days` — `PasswordAgeDays` on the active channel's key.
+
+    The `LocalAdminPasswordDate` field of `Win10-Laptop.json` is **not** a
+    binding — `collectors/agents.lua` derives it from
+    `host.local_user_accounts()` (deviation #20) by selecting the built-in
+    Administrator (SID ending `-500`) and reading its `last_password_set`.
+
+    **Intentional deviation from ComplianceApp:** `auto_laps_mode` emits
+    `"Not Installed"` where the C# `AutoLapsState.Unknown` serialises to
+    `"Unknown"`.  The `Win10-Laptop.json` parent test is
+    `AutoLapsMode != "Not Installed"`, which the string `"Unknown"` always
+    passes — so a host without LAPS is falsely reported compliant in C#.
+    Emitting `"Not Installed"` makes the test behave as intended.
+
+    Adds `pub(super) fn registry::key_exists(hive, key) -> bool` (existence
+    probe, no value read) to `registry.rs`.  No new Cargo feature
+    (`Win32_System_Registry` already present; DLL probes use `std::path`).
+
+    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve the `laps` module
+    declaration in `lib.rs`, the `install_laps_bindings` call in `install()`,
+    and `registry::key_exists`.
 
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is
