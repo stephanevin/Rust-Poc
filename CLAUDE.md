@@ -238,10 +238,11 @@ rust-poc-lua/src/
 ├── wfp.rs              # WfpEngine RAII, WfpMemoryGuard RAII, enumerate_wfp_state() (6 Win32 enums), wfp_net_events() — deviation #43
 ├── wfp_pipeline.rs     # Port of WfpFilterPipeline.cs — ALE filter, shadowing, dedup, wfp_sublayer_details(), wfp_firewall_view() — deviation #43
 ├── laps.rs             # Windows/Legacy LAPS posture — registry policy cascade + System32 DLL probes; laps_state() — deviation #44, not in upstream
+├── sentinelone.rs      # SentinelOne EDR — COM IDispatch late-binding (SentinelHelper.GetAgentStatusJSON) + Program Files exe search + Operational #104 CommSdk event — deviation #45, not in upstream
 └── ad.rs               # ADSI mail lookup stub (phase 2 in upstream)
 ```
 
-### The 73 `host.*` bindings exposed to Lua
+### The 76 `host.*` bindings exposed to Lua
 
 | Binding | Backend | Surface |
 |---|---|---|
@@ -318,6 +319,9 @@ rust-poc-lua/src/
 | `host.wfp_firewall_view()` **(deviation #43)** | ALE-filtered + shadowed + deduplicated firewall view; three pipeline steps from `WfpFilterPipeline.cs`; compact Unicode-symbol condition strings; sorted by direction / sublayer weight / effective weight; mirrors `WfpFirewallView.cs` | `array<{order_id, direction, name, provider_name, layer_name_normalized, sublayer_name, action, has_clear_action_right, conditions, conditions_json, variant_details[]}>` |
 | `host.wfp_net_events()` **(deviation #43)** | Up to 1 000 recent WFP net events via `FwpmNetEventEnum2` using an **ephemeral** engine; enriched from the shared `WfpState` cache (`filter_index`, `layer_id_index`); sorted timestamp DESC; `layerId < 200` heuristic omitted (intentional deviation); mirrors `WfpNetEvents.cs` | `array<{timestamp, direction, event_type, protocol_name, local_address, local_port, remote_address, remote_port, app_id, filter_id, filter_name, sublayer_name}>` |
 | `host.laps_state()` **(deviation #44)** | Windows/Legacy LAPS posture in one stateless call: legacy AdmPwd CSE key existence + System32 `laps.dll`/`lapscsp.dll` probes + 4-key policy cascade (`BackupDirectory`/`AdmPwdEnabled` presence) + `PasswordAgeDays`; mirrors `Security.cs` LAPS transformers; `auto_laps_mode` emits `"Not Installed"` (not C#'s `"Unknown"`) when no LAPS detected | `{auto_laps_mode, windows_laps_dll_state, laps_policy, laps_backup_directory, legacy_gp_extension_present, max_pwd_age_days}` |
+| `host.sentinel_one_agent_status()` **(deviation #45)** | COM **IDispatch late-binding** against the `SentinelHelper` ProgID (`CLSIDFromProgID` + `CoCreateInstance` + `GetIDsOfNames` + `Invoke` → `GetAgentStatusJSON`); deserializes the kebab-case JSON, re-emits snake_case; `nil` (silent) when ProgID unregistered; mirrors `SentinelOne.cs::GetSentinelOneAgentStatusFromJson` | `{active_threats_present, agent_id, agent_install_time, agent_ppl, agent_running, agent_version, detection_mode, enforcing_security, last_seen, management_url, reboot_reasons, self_protection_enabled, site}?` |
+| `host.sentinel_one_paths()` **(deviation #45)** | `%ProgramFiles%[(x86)]\SentinelOne` discovery + bounded recursive search; returns **all** `SentinelCtl.exe` / `sentinelAgent.exe` matches (arrays, not C#'s `LastOrDefault`); mirrors `GetSentinelOneFindFolderPath`/`FindCtlPath`/`FindAgentPath` | `{folder: string?, ctl_paths: [string], agent_paths: [string]}` |
+| `host.sentinel_one_comm_sdk()` **(deviation #45)** | Newest `SentinelOne/Operational` event #104 via `evt::query_events`; exposes `CommSdkMessage` + timestamp; `nil` on any Event Log failure (channel-absent = SentinelOne-not-installed); mirrors `GetSentinelOneCommSdkMessage(+Date)` | `{message: string?, date: string}?` |
 | `host.errors()` | Internal `HashMap<String, String>` accumulated by other bindings | `table<string, string>` |
 
 Bindings never raise — failures are recorded into `host.errors()` and
@@ -361,7 +365,7 @@ rejected by `resolve_script_path`).
 
 ### Deviations from a strict verbatim copy
 
-There are exactly **eighteen** points where copying upstream byte-for-byte
+There are exactly **nineteen** points where copying upstream byte-for-byte
 would not compile or would not match the surface this PoC needs to
 expose. Each one is documented inline at the touch site so a future
 re-sync is mechanical.
@@ -961,6 +965,56 @@ re-sync is mechanical.
     declaration in `lib.rs`, the `install_laps_bindings` call in `install()`,
     and `registry::key_exists`.
 
+17. **`rust-poc-lua/src/sentinelone.rs` + `install_sentinelone_bindings` in
+    `host.rs` — three SentinelOne EDR bindings (deviation #45).**
+    Not in upstream.  Mirrors `ComplianceService/Data/EDR/SentinelOne/SentinelOne.cs`.
+    Covers the 15 SentinelOne items of the EDR category in `Win10-Laptop.json`
+    via three sources, each a stateless call (no per-run `HostState` cache):
+    - `host.sentinel_one_agent_status()` — COM **IDispatch late-binding**
+      against the `SentinelHelper` ProgID, calling `GetAgentStatusJSON()` and
+      returning the 13 agent fields (snake_case).  This is the **first
+      late-bound COM call in the crate**; every other COM consumer (WMI, WUA,
+      `HNetCfg.FwProducts`) is early-bound against a typed `windows-rs`
+      interface.  `SentinelHelper` ships no type library, so we go through
+      `IDispatch` exactly as the C# `dynamic agent = Activator.CreateInstance(...)`.
+    - `host.sentinel_one_paths()` — `{folder, ctl_paths[], agent_paths[]}`.
+    - `host.sentinel_one_comm_sdk()` — newest `SentinelOne/Operational` #104
+      event (`CommSdkMessage` + timestamp) via `evt::query_events`.
+
+    `collectors/agents.lua` derives the parent `SentinelOneStatus`
+    (`#ctl_paths > 0 and agent_status ~= nil`) and the 15 item keys from these
+    three calls, plus one diagnostic path list (`sentinel_one_agent_paths`).
+    `ctl_paths` is returned by the binding (the parent test needs it) but not
+    re-exposed in the output — it lives in the same folder as `agent_paths`
+    and its presence is already encoded in `sentinel_one_status`.
+
+    **Intentional deviations from ComplianceApp:**
+    - **`paths()` returns arrays, not `LastOrDefault()`.** The C#
+      `GetSentinelOneFindCtlPath`/`FindAgentPath` keep a single path via
+      `Directory.GetFiles(..., AllDirectories).LastOrDefault()`.  The path is
+      never a compliance value (only an existence test), so returning the full
+      `Vec` is lossless for the semantics (`!is_empty()` ≡ `!= null`), drops the
+      arbitrary "last" rule, and is more diagnostic (versioned installs visible).
+    - **`agent_found` tests `sentinelAgent.exe`, not the folder.** The C#
+      `SentinelOneAgentFound` transformer tests `GetSentinelOneFindFolderPath()
+      != null` (folder presence) despite its "Agent Executable" label; the Lua
+      collector tests `#agent_paths > 0` to match the label.
+    - **Dates canonicalised to Zulu.** `GetAgentStatusJSON` returns
+      `agent-install-time`/`last-seen` as offset-aware ISO 8601
+      (e.g. `2026-05-29T11:15:25.000+00:00`).  `normalize_utc_iso8601` rewrites a
+      zero-offset suffix (`+00:00`/`-00:00`) to `Z`, matching ComplianceApp's wire
+      contract (`Timestamp.FromDateTime(dt.ToUniversalTime())`, UTC) and the rest
+      of this crate (`updates`/`winver`/`eventlog` emit `…Z`).  No time-zone
+      arithmetic: a non-zero offset stays verbatim (never observed from
+      SentinelOne, which reports `+00:00`).
+
+    No new Cargo feature: IDispatch needs `Win32_System_Com` +
+    `Win32_System_Ole` + `Win32_System_Variant`, all already enabled.
+
+    Re-sync impact: `Copy-Item` of `host.rs` MUST preserve the `sentinelone`
+    module declaration in `lib.rs` and the `install_sentinelone_bindings` call
+    in `install()`.
+
 Everything else — module names, function bodies, comments, doc
 strings, `#[allow(...)]` decorations, `SAFETY:` annotations — is
 byte-identical to upstream.
@@ -1007,6 +1061,17 @@ studying when the crate's source rolls past:
 - **COM/WMI** via the `wmi` crate — `COMLibrary::new` initialises COM,
   `WMIConnection::raw_query` runs typed-via-serde queries against
   `root\cimv2`.
+- **COM IDispatch late-binding** — `sentinelone.rs` (deviation #45) calls a
+  COM object that ships no type library, so it cannot be early-bound against a
+  typed `windows-rs` interface like every other COM consumer in the crate.
+  The flow mirrors a C# `dynamic`/`Activator.CreateInstance` call:
+  `CLSIDFromProgID("SentinelHelper")` → `CoCreateInstance` to `IDispatch` →
+  `GetIDsOfNames("GetAgentStatusJSON")` to resolve the method's `DISPID` →
+  `IDispatch::Invoke(DISPATCH_METHOD)` with an empty `DISPPARAMS` → read the
+  returned `VT_BSTR` `VARIANT` (`var.Anonymous.Anonymous.Anonymous.bstrVal`,
+  cleared with `VariantClear`). `Invoke` is feature-gated behind
+  `Win32_System_Ole` + `Win32_System_Variant`. (Reference: OLE Automation /
+  `IDispatch`.)
 - **mlua public traits** — `IntoLua` / `FromLua` / `LuaSerdeExt::to_value`
   / `Function::call` / `lua.create_function`. Closures captured into
   bindings need `'static` lifetimes, hence the `Rc` clones.

@@ -145,6 +145,13 @@ mod firewall;
 // ComplianceApp (Security.cs). Deviation #44.
 #[cfg(windows)]
 mod laps;
+// `sentinelone` exposes 3 SentinelOne EDR bindings: agent status via COM
+// IDispatch late-binding (SentinelHelper.GetAgentStatusJSON), installation
+// paths (Program Files\SentinelOne recursive exe search), and the newest
+// SentinelOne/Operational #104 CommSdk event. Mirrors the SentinelOne data
+// service in ComplianceApp (EDR/SentinelOne/SentinelOne.cs). Deviation #45.
+#[cfg(windows)]
+mod sentinelone;
 // `wfp_known_guids` holds three lazily-initialised `HashMap<GUID, &str>` maps
 // (layer GUIDs 110+, sublayer GUIDs 17+, condition field GUIDs ~100).
 // Consumed by `wfp_conditions` and `wfp` for human-readable enrichment.

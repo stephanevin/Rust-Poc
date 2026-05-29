@@ -17,7 +17,7 @@ use mlua::{
 
 use super::{
     accounts, ad, bitlocker, cloud, credentialguard, ep, firewall, gpo, laps, net, regional,
-    registry, software, tls, updates, wfp, wfp_pipeline, winver, wmi::Wmi, wnf, wts,
+    registry, sentinelone, software, tls, updates, wfp, wfp_pipeline, winver, wmi::Wmi, wnf, wts,
 };
 
 /// Canonical `host.errors()` key for any failure of
@@ -336,6 +336,7 @@ pub(super) fn install(
     install_firewall_bindings(lua, &host, &state)?;
     install_wfp_bindings(lua, &host, &state)?;
     install_laps_bindings(lua, &host)?;
+    install_sentinelone_bindings(lua, &host, &state)?;
     install_composites(lua, &host, &state)?;
     install_errors(lua, &host, &state)?;
 
@@ -1832,6 +1833,72 @@ fn install_laps_bindings(lua: &Lua, host: &Table) -> LuaResult<()> {
                 .map_err(|e| mlua::Error::runtime(format!("laps_state serialize: {e}")))
         })?,
     )?;
+
+    Ok(())
+}
+
+// --- SentinelOne EDR bindings (deviation #45) ------------------------
+
+fn install_sentinelone_bindings(lua: &Lua, host: &Table, state: &HostRef) -> LuaResult<()> {
+    // host.sentinel_one_agent_status() — COM IDispatch late-binding against
+    // the SentinelHelper ProgID (GetAgentStatusJSON).  Returns the 13 agent
+    // fields (snake_case) or nil.  Mirrors GetSentinelOneAgentStatusFromJson.
+    //
+    // ProgID absent → SentinelOne not installed → nil, SILENT (not an error).
+    // Any failure after the CLSID resolves (instantiation / Invoke / JSON
+    // parse) is a real error recorded under "s1:agent_status".
+    {
+        let s = state.clone();
+        host.set(
+            "sentinel_one_agent_status",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match sentinelone::agent_status() {
+                    Ok(Some(v)) => Ok(lua_to_value_or_nil(lua, &mut st, "s1:agent_status", &v)),
+                    Ok(None) => Ok(Value::Nil),
+                    Err(e) => {
+                        st.record_error("s1:agent_status", e);
+                        Ok(Value::Nil)
+                    }
+                }
+            })?,
+        )?;
+    }
+
+    // host.sentinel_one_paths() — {folder, ctl_paths[], agent_paths[]}.
+    // Infallible: missing folder → null folder + empty arrays.  The Lua
+    // collector derives the parent SentinelOneStatus (non-empty ctl_paths)
+    // and AgentFound (non-empty agent_paths) from these lists.
+    // Mirrors GetSentinelOneFindFolderPath / FindCtlPath / FindAgentPath.
+    {
+        let s = state.clone();
+        host.set(
+            "sentinel_one_paths",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                let value = sentinelone::paths();
+                Ok(lua_to_value_or_nil(lua, &mut st, "s1:paths", &value))
+            })?,
+        )?;
+    }
+
+    // host.sentinel_one_comm_sdk() — newest SentinelOne/Operational #104
+    // event ({message, date}) or nil.  Swallows every Event Log failure to
+    // nil (channel absent is the dominant non-SentinelOne case), matching
+    // the C# catch-all.  Mirrors GetSentinelOneCommSdkMessage(+Date).
+    {
+        let s = state.clone();
+        host.set(
+            "sentinel_one_comm_sdk",
+            lua.create_function(move |lua, ()| {
+                let mut st = s.borrow_mut();
+                match sentinelone::comm_sdk() {
+                    Some(v) => Ok(lua_to_value_or_nil(lua, &mut st, "s1:comm_sdk", &v)),
+                    None => Ok(Value::Nil),
+                }
+            })?,
+        )?;
+    }
 
     Ok(())
 }

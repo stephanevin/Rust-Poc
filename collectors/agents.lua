@@ -1,7 +1,7 @@
 -- Agents category collector — Cloud (AzureAD / MDM) + Endpoint Protection (EP)
---                              + Firewall (FW) + WFP + LAPS.
+--                              + Firewall (FW) + WFP + LAPS + SentinelOne EDR.
 --
--- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42 + #43 + #44):
+-- Mirrors the "Agents" tab of Win10-Laptop.json (deviation #39 + #40 + #42 + #43 + #44 + #45):
 --
 -- Cloud (deviation #39):
 --   AzureAdJoinedStatus.cs    → azure_ad_joined_status    ("On"/"Off"/"CertificateIsNotValid")
@@ -52,6 +52,29 @@
 -- All six host.laps_state() fields come from one stateless call (registry +
 -- System32 DLL probes); local_admin_password_date is derived from
 -- host.local_user_accounts() (deviation #20).
+--
+-- SentinelOne EDR (deviation #45):
+--   SentinelOneStatus.cs               → sentinel_one_status                  (bool: SentinelCtl.exe present AND COM status available)
+--   SentinelOneAgentFound.cs           → sentinel_one_agent_found            ("Found"/"NotFound" — tests sentinelAgent.exe, see deviation #45.2)
+--   SentinelOneAgentRunning.cs         → sentinel_one_agent_running          (bool?)
+--   SentinelOneAgentVersion.cs         → sentinel_one_agent_version          (string?)
+--   SentinelOneEnforcingSecurity.cs    → sentinel_one_enforcing_security     (bool?)
+--   SentinelOneManagementUrl.cs        → sentinel_one_management_url         (string?)
+--   SentinelOneLastSeenDate.cs         → sentinel_one_last_seen_date         (ISO 8601 string?)
+--   SentinelOneActiveThreatsPresent.cs → sentinel_one_active_threats_present ("Yes"/"No")
+--   SentinelOneAgentId.cs              → sentinel_one_agent_id               (string?)
+--   SentinelOneAgentInstallTime.cs     → sentinel_one_agent_install_time     (ISO 8601 string?)
+--   SentinelOneAgentPpl.cs             → sentinel_one_agent_ppl              (bool?)
+--   SentinelOneCommSdkMessage.cs       → sentinel_one_comm_sdk_message       (string?)
+--   SentinelOneCommSdkMessageDate.cs   → sentinel_one_comm_sdk_message_date  (ISO 8601 string?)
+--   SentinelOneDetectionMode.cs        → sentinel_one_detection_mode         (string?)
+--   SentinelOneSelfProtectionEnabled.cs→ sentinel_one_self_protection_enabled(bool?)
+--   SentinelOneSite.cs                 → sentinel_one_site                   (string?)
+--
+-- The 13 agent fields come from one COM IDispatch call (host.sentinel_one_agent_status());
+-- the parent + agent_found from host.sentinel_one_paths(); the CommSdk pair from
+-- host.sentinel_one_comm_sdk().  sentinel_one_agent_paths is exposed as a
+-- diagnostic enrichment (full sentinelAgent.exe list, beyond the 15 C# items).
 --
 -- Run via:
 --   cargo run -- agents.lua
@@ -142,6 +165,20 @@ function collect()
     end
   end
 
+  -- SentinelOne EDR (deviation #45) ------------------------------------------
+  -- Three sources: COM IDispatch agent status, filesystem paths, Event Log.
+  local s1 = host.sentinel_one_agent_status()  -- table|nil (13 fields, COM)
+  local s1_paths = host.sentinel_one_paths()   -- {folder, ctl_paths[], agent_paths[]}
+  local s1_comm = host.sentinel_one_comm_sdk() -- {message, date}|nil
+
+  -- ctl present ≡ GetSentinelOneFindCtlPath() != null; agent present ≡
+  -- sentinelAgent.exe found (deviation #45.2: the C# AgentFound tests the
+  -- folder, we test the executable to match its "Agent Executable" label).
+  local s1_ctl_found = s1_paths and #s1_paths.ctl_paths > 0
+  local s1_agent_found = s1_paths and #s1_paths.agent_paths > 0
+  -- Parent SentinelOneStatus: SentinelCtl.exe present AND COM status available.
+  local s1_installed = s1_ctl_found and (s1 ~= nil) or false
+
   return {
     -- Cloud — AzureAD join status + MDM/Intune enrollment.
     azure_ad_joined_status     = host.azure_ad_joined_status(),
@@ -202,6 +239,32 @@ function collect()
     legacy_laps_gp_extension   = laps and laps.legacy_gp_extension_present,
     local_admin_password_date  = local_admin_password_date,
     windows_laps_max_pwd_age   = laps and laps.max_pwd_age_days,
+
+    -- SentinelOne EDR (deviation #45) — 15 C# items + 2 diagnostic path lists.
+    sentinel_one_status                  = s1_installed,
+    sentinel_one_agent_found             = s1_agent_found and "Found" or "NotFound",
+    sentinel_one_agent_running           = s1 and s1.agent_running,
+    sentinel_one_agent_version           = s1 and s1.agent_version,
+    sentinel_one_enforcing_security      = s1 and s1.enforcing_security,
+    sentinel_one_management_url          = s1 and s1.management_url,
+    sentinel_one_last_seen_date          = s1 and s1.last_seen,
+    -- C# maps null/false → "No" when the agent status is present (only nil
+    -- when SentinelOne itself is absent), so test `== true` explicitly.
+    sentinel_one_active_threats_present  = s1 and (s1.active_threats_present == true and "Yes" or "No"),
+    sentinel_one_agent_id                = s1 and s1.agent_id,
+    sentinel_one_agent_install_time      = s1 and s1.agent_install_time,
+    sentinel_one_agent_ppl               = s1 and s1.agent_ppl,
+    sentinel_one_comm_sdk_message        = s1_comm and s1_comm.message,
+    sentinel_one_comm_sdk_message_date   = s1_comm and s1_comm.date,
+    sentinel_one_detection_mode          = s1 and s1.detection_mode,
+    sentinel_one_self_protection_enabled = s1 and s1.self_protection_enabled,
+    sentinel_one_site                    = s1 and s1.site,
+
+    -- Diagnostic enrichment (beyond the 15 C# items): every sentinelAgent.exe
+    -- found (location + version of each install). ctl_paths is intentionally
+    -- not exposed — same folder as agent_paths, and SentinelCtl.exe presence
+    -- is already encoded in sentinel_one_status.
+    sentinel_one_agent_paths             = s1_paths and s1_paths.agent_paths or {},
 
     _errors = host.errors(),
   }
